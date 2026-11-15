@@ -1,0 +1,7 @@
+# 环境锁定（本框架验证版本）
+# 安装: pip install -r requirements_lock.txt
+torch==2.2.0
+pandas==2.0.3
+numpy==1.24.3
+pyarrow==17.0.0
+safetensors==0.5.3

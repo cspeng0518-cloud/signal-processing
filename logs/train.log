@@ -1,0 +1,55 @@
+2026-11-15 16:28:41,479 [INFO] device: cuda, backbone: transformer
+2026-11-15 16:28:41,946 [INFO] MAE pretraining on 600 unlabeled IQ samples
+2026-11-15 16:28:42,641 [INFO] params: shared=2.38M heads=108.8K shared_ratio=95.6%
+2026-11-15 16:29:02,642 [INFO] device: cuda, backbone: transformer
+2026-11-15 16:29:02,714 [INFO] MAE pretraining on 600 unlabeled IQ samples
+2026-11-15 16:29:03,312 [INFO] params: shared=2.38M heads=108.8K shared_ratio=95.6%
+2026-11-15 16:29:05,862 [INFO] epoch 1/5  recon_mse=0.081048
+2026-11-15 16:29:06,631 [INFO] epoch 2/5  recon_mse=0.072184
+2026-11-15 16:29:07,398 [INFO] epoch 3/5  recon_mse=0.071584
+2026-11-15 16:29:08,162 [INFO] epoch 4/5  recon_mse=0.070071
+2026-11-15 16:29:08,943 [INFO] epoch 5/5  recon_mse=0.069136
+2026-11-15 16:29:08,977 [INFO] saved MAE weights -> D:\MyFiles\SignalDetection\weights/mae_pretrained.pt
+2026-11-15 16:29:17,512 [INFO] device: cuda, backbone: transformer
+2026-11-15 16:29:17,651 [INFO] dataloaders ready: system(train=200), modulation(train=200), parameter(train=200)
+2026-11-15 16:29:18,262 [INFO] loaded MAE pretrained weights from D:\MyFiles\SignalDetection\weights\mae_pretrained.pt
+2026-11-15 16:29:18,262 [INFO] shared_ratio = 95.63% (官方红线 >80%)
+2026-11-15 16:29:34,002 [INFO] device: cuda, backbone: transformer
+2026-11-15 16:29:34,098 [INFO] dataloaders ready: system(train=200), modulation(train=200), parameter(train=200)
+2026-11-15 16:29:34,694 [INFO] loaded MAE pretrained weights from D:\MyFiles\SignalDetection\weights\mae_pretrained.pt
+2026-11-15 16:29:34,695 [INFO] shared_ratio = 95.63% (官方红线 >80%)
+2026-11-15 16:29:50,746 [INFO] device: cuda, backbone: transformer
+2026-11-15 16:29:50,841 [INFO] dataloaders ready: system(train=200), modulation(train=200), parameter(train=200)
+2026-11-15 16:29:51,445 [INFO] loaded MAE pretrained weights from D:\MyFiles\SignalDetection\weights\mae_pretrained.pt
+2026-11-15 16:29:51,446 [INFO] shared_ratio = 95.63% (官方红线 >80%)
+2026-11-15 16:29:55,668 [INFO] epoch 1/15  loss[system: 2.0293 | modulation: 3.1412 | parameter: 0.0957]
+2026-11-15 16:29:58,268 [INFO] epoch 2/15  loss[system: 1.9229 | modulation: 3.1283 | parameter: 0.0946]
+2026-11-15 16:30:00,862 [INFO] epoch 3/15  loss[system: 1.9011 | modulation: 3.1262 | parameter: 0.0938]
+2026-11-15 16:30:03,461 [INFO] epoch 4/15  loss[system: 1.8734 | modulation: 3.1189 | parameter: 0.0929]
+2026-11-15 16:30:06,053 [INFO] epoch 5/15  loss[system: 1.8393 | modulation: 3.1165 | parameter: 0.0956]
+2026-11-15 16:30:06,222 [INFO]   val system: acc=0.400 recall=0.125 | modulation: acc=0.050 recall=0.048 | parameter: precision=0.000
+2026-11-15 16:30:27,118 [INFO] device: cuda, backbone: transformer
+2026-11-15 16:30:27,208 [INFO] dataloaders ready: system(train=200), modulation(train=200), parameter(train=200)
+2026-11-15 16:30:27,830 [INFO] loaded MAE pretrained weights from D:\MyFiles\SignalDetection\weights\mae_pretrained.pt
+2026-11-15 16:30:27,831 [INFO] shared_ratio = 95.63% (官方红线 >80%)
+2026-11-15 16:30:31,917 [INFO] epoch 1/15  loss[system: 2.0027 | modulation: 3.1380 | parameter: 0.0951]
+2026-11-15 16:30:34,504 [INFO] epoch 2/15  loss[system: 1.9290 | modulation: 3.1227 | parameter: 0.0930]
+2026-11-15 16:30:37,098 [INFO] epoch 3/15  loss[system: 1.8675 | modulation: 3.1213 | parameter: 0.0936]
+2026-11-15 16:30:39,686 [INFO] epoch 4/15  loss[system: 1.8648 | modulation: 3.1154 | parameter: 0.0947]
+2026-11-15 16:30:42,277 [INFO] epoch 5/15  loss[system: 1.8242 | modulation: 3.1101 | parameter: 0.0960]
+2026-11-15 16:30:42,430 [INFO]   val system: acc=0.400 recall=0.125 | modulation: acc=0.050 recall=0.048 | parameter: precision=0.000
+2026-11-15 16:30:42,468 [INFO]   saved best (mean=0.1500)
+2026-11-15 16:30:45,157 [INFO] epoch 6/15  loss[system: 1.8195 | modulation: 3.1107 | parameter: 0.0949]
+2026-11-15 16:30:47,751 [INFO] epoch 7/15  loss[system: 1.7995 | modulation: 3.1123 | parameter: 0.0959]
+2026-11-15 16:30:50,343 [INFO] epoch 8/15  loss[system: 1.7550 | modulation: 3.0993 | parameter: 0.0954]
+2026-11-15 16:30:52,934 [INFO] epoch 9/15  loss[system: 1.7732 | modulation: 3.1034 | parameter: 0.0951]
+2026-11-15 16:30:55,537 [INFO] epoch 10/15  loss[system: 1.7150 | modulation: 3.1009 | parameter: 0.0939]
+2026-11-15 16:30:55,691 [INFO]   val system: acc=0.400 recall=0.125 | modulation: acc=0.050 recall=0.048 | parameter: precision=0.000
+2026-11-15 16:30:58,316 [INFO] epoch 11/15  loss[system: 1.7796 | modulation: 3.0899 | parameter: 0.0929]
+2026-11-15 16:31:00,919 [INFO] epoch 12/15  loss[system: 1.7405 | modulation: 3.0851 | parameter: 0.0934]
+2026-11-15 16:31:03,521 [INFO] epoch 13/15  loss[system: 1.7751 | modulation: 3.0940 | parameter: 0.0940]
+2026-11-15 16:31:06,136 [INFO] epoch 14/15  loss[system: 1.7268 | modulation: 3.0874 | parameter: 0.0974]
+2026-11-15 16:31:08,734 [INFO] epoch 15/15  loss[system: 1.7811 | modulation: 3.0977 | parameter: 0.0966]
+2026-11-15 16:31:08,890 [INFO]   val system: acc=0.400 recall=0.125 | modulation: acc=0.050 recall=0.048 | parameter: precision=0.000
+2026-11-15 16:31:08,910 [INFO]   saved best (mean=0.1500)
+2026-11-15 16:31:08,952 [INFO] finetune done.

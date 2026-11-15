@@ -1,0 +1,133 @@
+{
+  "files": {
+    "datasets\\01\\rf_signal_benchmark_train_v1.0\\rf_signal_benchmark_train_v1.0_part_001_of_003.parquet": {
+      "row_groups_total": 339,
+      "row_groups_read": 339,
+      "rows_read": 346264
+    },
+    "datasets\\02\\rf_signal_benchmark_train_v1.0\\rf_signal_benchmark_train_v1.0_part_002_of_003.parquet": {
+      "row_groups_total": 405,
+      "row_groups_read": 405,
+      "rows_read": 414336
+    },
+    "datasets\\03\\rf_signal_benchmark_train_v1.0\\rf_signal_benchmark_train_v1.0_part_003_of_003.parquet": {
+      "row_groups_total": 409,
+      "row_groups_read": 409,
+      "rows_read": 418400
+    }
+  },
+  "n_rows_scanned": 1179000,
+  "task_distribution": {
+    "modulation": 207000,
+    "protocol": 144000,
+    "parameter": 828000
+  },
+  "iq_length_distribution": {
+    "1024": 710970,
+    "512": 468030
+  },
+  "modulation_distribution": {
+    "OOK": 9000,
+    "GFSK": 9000,
+    "Radar/Barker Code": 9000,
+    "Radar/Polyphase Barker Code": 9000,
+    "64QAM": 9000,
+    "OQPSK": 9000,
+    "AQPSK": 9000,
+    "8PSK": 9000,
+    "Radar/Coherent Pulse Train": 9000,
+    "Radar/LFM": 9000,
+    "BPSK": 9000,
+    "256QAM": 9000,
+    "Radar/Frank Code": 9000,
+    "128QAM": 9000,
+    "32QAM": 9000,
+    "4FSK": 9000,
+    "FM": 9000,
+    "2FSK": 9000,
+    "16QAM": 9000,
+    "pi_4DQPSK": 9000,
+    "QPSK": 9000,
+    "CSS": 9000,
+    "MSK": 9000
+  },
+  "protocol_distribution": {
+    "Idle background": 18000,
+    "5G": 18000,
+    "Radar": 18000,
+    "LoRa": 18000,
+    "Bluetooth": 18000,
+    "ZigBee": 18000,
+    "WiFi": 18000,
+    "FM broadcast": 18000
+  },
+  "valid_combo_patterns": {
+    "0001111": 414000,
+    "1110000": 414000
+  },
+  "param_stats": {
+    "symbol_rate": {
+      "n_valid": 414000,
+      "valid_rate_pct": 50.0,
+      "min": 62.5,
+      "p25": 100.0,
+      "median": 300.0,
+      "p75": 1000.0,
+      "max": 2000.0
+    },
+    "bandwidth": {
+      "n_valid": 414000,
+      "valid_rate_pct": 50.0,
+      "min": 65.0,
+      "p25": 195.0,
+      "median": 675.0,
+      "p75": 2000.0,
+      "max": 3500.0
+    },
+    "frequency_shift": {
+      "n_valid": 414000,
+      "valid_rate_pct": 50.0,
+      "min": -50.0,
+      "p25": 10.0,
+      "median": 100.0,
+      "p75": 100.0,
+      "max": 1000.0
+    },
+    "pulse_width": {
+      "n_valid": 414000,
+      "valid_rate_pct": 50.0,
+      "min": 1.0000078873417806e-05,
+      "p25": 1.1502590496093035e-05,
+      "median": 1.3003967978875153e-05,
+      "p75": 1.4503788406727836e-05,
+      "max": 1.5999929019017145e-05
+    },
+    "pri": {
+      "n_valid": 414000,
+      "valid_rate_pct": 50.0,
+      "min": 1.7000029401970096e-05,
+      "p25": 1.8495065887691453e-05,
+      "median": 1.9998996322101448e-05,
+      "p75": 2.1495252894965233e-05,
+      "max": 2.2999996872385964e-05
+    },
+    "time_delay": {
+      "n_valid": 414000,
+      "valid_rate_pct": 50.0,
+      "min": 1.000015004137822e-06,
+      "p25": 3.251306907259277e-06,
+      "median": 5.499827238963917e-06,
+      "p75": 7.75134776631603e-06,
+      "max": 9.999991561926436e-06
+    },
+    "number_of_pulses": {
+      "n_valid": 414000,
+      "valid_rate_pct": 50.0,
+      "min": 2.0,
+      "p25": 3.0,
+      "median": 4.0,
+      "p75": 5.0,
+      "max": 6.0
+    }
+  }
+}
