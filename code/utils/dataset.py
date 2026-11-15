@@ -162,7 +162,7 @@ class EMSignalDataset(Dataset):
             params = params * valid
             item["params"] = torch.from_numpy(params.astype(np.float32))
             item["valid"] = torch.from_numpy(valid)
-            item["pattern"] = torch.tensor(pattern, dtype=torch.long)
+            item["pattern"] = torch.tensor(int(pattern), dtype=torch.long)
         return item
 
 
@@ -184,11 +184,12 @@ class PreparedOfficialDataset(Dataset):
         self.task = task
         self.seq_len = seq_len
         self.param_stats = param_stats
+        self.n = len(self.meta["sample_ids"])
         self.iq = np.memmap(os.path.join(d, "iq.memap"), dtype=np.float32, mode="r",
-                            shape=(len(self.meta["labels"]), seq_len, 2))
+                            shape=(self.n, seq_len, 2))
 
     def __len__(self):
-        return len(self.meta["labels"])
+        return self.n
 
     def __getitem__(self, i):
         iq = np.array(self.iq[i])  # memmap 切片拷贝
@@ -211,7 +212,7 @@ class PreparedOfficialDataset(Dataset):
             params = params * valid
             item["params"] = torch.from_numpy(params.astype(np.float32))
             item["valid"] = torch.from_numpy(valid)
-            item["pattern"] = torch.tensor(pattern, dtype=torch.long)
+            item["pattern"] = torch.tensor(int(pattern), dtype=torch.long)
         return item
 
 
@@ -219,24 +220,21 @@ def make_task_dataset(data_dir, task, split="train", seq_len=1024, param_stats=N
     """统一工厂：优先用预处理 memmap（官方数据），否则退回 Parquet。
 
     data_dir 布局二选一:
-      官方预处理: {split}_{task}.parquet + {task}/iq.memap + {task}/meta.json
-                  （prepare_official.py 产出，val 划分也在其中）
+      官方预处理: {task}/iq.memap + {task}/meta.json（val 划分记录在 meta 的
+                  val_sample_ids，train/val 均从同一 memmap 过滤）
       模拟数据:   {split}_{task}.parquet（data_gen.py 产出）
     """
-    # 1) Parquet 路径（两种布局都可能有）
-    pq_path = os.path.join(data_dir, f"{split}_{task}.parquet")
-    # 2) memmap 布局（val 在 meta 内部用 split 字段划分）
     mm_dir = os.path.join(data_dir, task)
     has_mm = os.path.exists(os.path.join(mm_dir, "meta.json"))
-    if split == "train" and has_mm:
-        ds = PreparedOfficialDataset(data_dir, task, seq_len, param_stats)
-        # meta 中带 val 划分时，train = 全量 - val
-        val_ids = set(ds.meta.get("val_sample_ids", []))
-        if val_ids:
-            keep = [i for i, s in enumerate(ds.meta["sample_ids"])
-                    if s not in val_ids]
-            ds = torch.utils.data.Subset(ds, keep)
-        return ds
+    if has_mm:
+        full = PreparedOfficialDataset(data_dir, task, seq_len, param_stats)
+        val_ids = set(full.meta.get("val_sample_ids", []))
+        if split == "val" and not val_ids:
+            raise FileNotFoundError(f"{task} has no val split in meta")
+        keep = [i for i, s in enumerate(full.meta["sample_ids"])
+                if (s in val_ids) == (split == "val")]
+        return torch.utils.data.Subset(full, keep)
+    pq_path = os.path.join(data_dir, f"{split}_{task}.parquet")
     if os.path.exists(pq_path):
         return EMSignalDataset(pq_path, task, seq_len, param_stats)
     raise FileNotFoundError(f"no dataset for task={task}, split={split} under {data_dir}")
@@ -275,8 +273,8 @@ def build_task_dataloaders(data_dir, batch_size=32, seq_len=1024, splits=("train
                            tasks=("protocol", "modulation", "parameter")):
     """构建多任务 DataLoader 字典
 
-    约定: data_dir 下每任务一个文件 {split}_{task}.parquet
-          (模拟数据 data_gen.py 与 utils/prepare_official.py 均按此约定产出)
+    优先使用预处理 memmap 布局（{task}/iq.memap + meta.json，val 划分在 meta 内），
+    否则退回 Parquet 布局（{split}_{task}.parquet，模拟数据 data_gen.py 产出）。
 
     Returns:
         loaders = {
@@ -284,18 +282,17 @@ def build_task_dataloaders(data_dir, batch_size=32, seq_len=1024, splits=("train
           "val": {...},
         }, param_stats
     """
-    param_path = os.path.join(data_dir, "train_parameter.parquet")
-    param_stats = compute_param_stats(param_path) if os.path.exists(param_path) else \
-        {"min": DEFAULT_PARAM_STATS["min"].copy(), "max": DEFAULT_PARAM_STATS["max"].copy()}
+    param_stats = {"min": DEFAULT_PARAM_STATS["min"].copy(),
+                   "max": DEFAULT_PARAM_STATS["max"].copy()}
     loaders = {}
     for split in splits:
         loaders[split] = {}
         for task in tasks:
-            path = os.path.join(data_dir, f"{split}_{task}.parquet")
-            if not os.path.exists(path):
+            try:
+                ds = make_task_dataset(data_dir, task, split=split, seq_len=seq_len,
+                                       param_stats=param_stats if task == "parameter" else None)
+            except FileNotFoundError:
                 continue
-            ds = EMSignalDataset(path, task, seq_len=seq_len,
-                                 param_stats=param_stats if task == "parameter" else None)
             loaders[split][task] = DataLoader(
                 ds, batch_size=batch_size, shuffle=(split == "train"),
                 collate_fn=collate_fn, num_workers=0,

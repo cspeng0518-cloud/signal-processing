@@ -43,8 +43,8 @@ class MixedMAEDataset(EMSignalDataset):
 
     def __getitem__(self, i):
         row = self.df.iloc[i]
-        from utils.dataset import bytes_to_iq
-        iq = bytes_to_iq(row["iq"], self.seq_len)
+        from utils.dataset import to_iq_array
+        iq = to_iq_array(row["iq"], self.seq_len)
         return {"iq": torch.from_numpy(iq),
                 "sr": torch.tensor(FS, dtype=torch.float32)}
 
@@ -68,11 +68,16 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"device: {device}, backbone: {cfg['backbone']}")
 
-    # ---- 数据：三任务训练 IQ 混用 ----
+    # ---- 数据：三任务训练 IQ 混用（官方数据或模拟数据布局均可）----
     ds_list = []
-    for task in ("system", "modulation", "parameter"):
+    for task in ("protocol", "modulation", "parameter"):
         p = os.path.join(args.data_dir, f"train_{task}.parquet")
+        if not os.path.exists(p):
+            logger.warning(f"missing {p}, skip")
+            continue
         ds_list.append(MixedMAEDataset(p, task, seq_len=cfg["seq_len"]))
+    if not ds_list:
+        raise FileNotFoundError(f"no train_*.parquet under {args.data_dir}")
     dataset = torch.utils.data.ConcatDataset(ds_list)
     loader = DataLoader(dataset, batch_size=cfg["batch_size"], shuffle=True,
                         collate_fn=mae_collate, num_workers=cfg["num_workers"])

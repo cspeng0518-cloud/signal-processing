@@ -1,1 +1,9 @@
 datasets/
+datasets_official/
+weights/
+weights_smoke/
+logs/
+out/
+__pycache__/
+.pytest_cache/
+*.pyc

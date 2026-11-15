@@ -30,6 +30,13 @@ import pyarrow.parquet as pq
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, ROOT)
+# 复用 code/utils/dataset.py 的双格式 iq 读取（同名包冲突，按路径加载）
+import importlib.util as _ilu
+_spec = _ilu.spec_from_file_location(
+    "_official_ds", os.path.join(ROOT, "code", "utils", "dataset.py"))
+_official_ds = _ilu.module_from_spec(_spec)
+_spec.loader.exec_module(_official_ds)
+to_iq_array = _official_ds.to_iq_array
 
 PARAM_NAMES = [
     "symbol_rate", "bandwidth", "frequency_shift",
@@ -68,14 +75,8 @@ class TaskWriter:
                      "valid": [], "patterns": [], "sample_ids": []}
 
     def add(self, row):
-        arr = np.asarray(row["iq"], dtype=np.float32)
-        if arr.ndim == 3 and arr.shape[0] == 1:
-            arr = arr[0]
-        assert arr.ndim == 2 and arr.shape[1] == 2, f"bad iq shape {arr.shape}"
-        if arr.shape[0] < self.seq_len:  # 右侧补零
-            arr = np.pad(arr, ((0, self.seq_len - arr.shape[0]), (0, 0)))
-        else:
-            arr = arr[:self.seq_len]
+        arr = to_iq_array(row["iq"], max_len=self.seq_len)
+        assert arr.shape == (self.seq_len, 2), f"bad iq shape {arr.shape}"
         self._fh.write(arr.astype(np.float32).tobytes())
         self.n_written += 1
         self.meta["sample_ids"].append(row["sample_id"])
@@ -163,21 +164,24 @@ def run(limit=None, val_ratio=0.02, out_dir=None):
         print(f"[prepare] {task}: {n} samples "
               f"(val={len(val_ids[task])}) -> {w.dir}")
 
-    # ---- 兼容布局 Parquet（含 iq 列，供 EMSignalDataset/build_task_dataloaders 直接用）----
-    # 每任务 train/val 各一个文件，19 列官方 schema（分类任务参数列填 0.0/False）
+    # ---- 兼容布局 Parquet（仅冒烟/小规模；全量训练直接走 memmap 更省内存）----
     summary = {}
-    for task, w in writers.items():
-        m = w.meta
-        n = w.n_written
-        if n == 0:
-            continue
-        is_val = np.array([s in val_ids[task] for s in m["sample_ids"]])
-        mm = np.memmap(w.iq_path, dtype=np.float32, mode="r", shape=(n, SEQ_LEN, 2))
-        for split, keep in (("train", ~is_val), ("val", is_val)):
-            df = build_compat_df(task, m, mm, np.where(keep)[0])
-            to_legacy_parquet(df, out_dir, split, task)
-            summary[f"{split}_{task}"] = len(df)
-            print(f"[prepare] {split}_{task}.parquet: {len(df)} rows")
+    if limit is not None:
+        for task, w in writers.items():
+            m = w.meta
+            n = w.n_written
+            if n == 0:
+                continue
+            is_val = np.array([s in val_ids[task] for s in m["sample_ids"]])
+            mm = np.memmap(w.iq_path, dtype=np.float32, mode="r", shape=(n, SEQ_LEN, 2))
+            for split, keep in (("train", ~is_val), ("val", is_val)):
+                df = build_compat_df(task, m, mm, np.where(keep)[0])
+                to_legacy_parquet(df, out_dir, split, task)
+                summary[f"{split}_{task}"] = len(df)
+                print(f"[prepare] {split}_{task}.parquet: {len(df)} rows")
+    else:
+        print("[prepare] full-scale mode: skip compat parquet "
+              "(train/val read memmap directly via make_task_dataset)")
 
     with open(os.path.join(out_dir, "prepare_summary.json"), "w", encoding="utf-8") as f:
         json.dump({"counts": counts, "val_ratio": val_ratio, "seq_len": SEQ_LEN,
@@ -214,10 +218,47 @@ def build_compat_df(task, meta, mm, indices):
     return pd.DataFrame(rows)
 
 
+def rebuild_compat(out_dir, per_shard=50000):
+    """从已有 memmap+meta 分片重建兼容布局 parquet（大表内存安全，输出分片文件）
+
+    全量训练无需此步（make_task_dataset 直接读 memmap）；分片仅用于小规模实验。
+    产出: {split}_{task}.shard000.parquet, .shard001, ...
+    """
+    summary = {}
+    for task in ("protocol", "modulation", "parameter"):
+        d = os.path.join(out_dir, task)
+        with open(os.path.join(d, "meta.json"), encoding="utf-8") as f:
+            meta = json.load(f)
+        n = len(meta["sample_ids"])
+        val_ids = set(meta.get("val_sample_ids", []))
+        is_val = np.array([s in val_ids for s in meta["sample_ids"]])
+        mm = np.memmap(os.path.join(d, "iq.memap"), dtype=np.float32, mode="r",
+                       shape=(n, meta["seq_len"], 2))
+        for split, keep in (("train", ~is_val), ("val", is_val)):
+            idx_all = np.where(keep)[0]
+            total = 0
+            for si in range(0, len(idx_all), per_shard):
+                idx = idx_all[si:si + per_shard]
+                df = build_compat_df(task, meta, mm, idx)
+                p = os.path.join(out_dir, f"{split}_{task}.shard{si//per_shard:03d}.parquet")
+                df.to_parquet(p, index=False)
+                total += len(df)
+            summary[f"{split}_{task}"] = total
+            print(f"[compat] {split}_{task}: {total} rows in "
+                  f"{(len(idx_all)+per_shard-1)//per_shard} shards")
+    with open(os.path.join(out_dir, "prepare_summary.json"), "w", encoding="utf-8") as f:
+        json.dump({"val_ratio": None, "seq_len": SEQ_LEN, "splits": summary}, f, indent=2)
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--limit", type=int, default=None, help="每任务最多处理行数（冒烟用）")
     ap.add_argument("--val_ratio", type=float, default=0.02)
     ap.add_argument("--out_dir", default=None)
+    ap.add_argument("--only_compat", action="store_true",
+                    help="跳过重扫官方分块，仅从已有 memmap+meta 重建兼容 parquet")
     args = ap.parse_args()
-    run(limit=args.limit, val_ratio=args.val_ratio, out_dir=args.out_dir)
+    if args.only_compat:
+        rebuild_compat(args.out_dir or os.path.join(ROOT, "datasets_official"))
+    else:
+        run(limit=args.limit, val_ratio=args.val_ratio, out_dir=args.out_dir)

@@ -84,10 +84,13 @@ def evaluate(model, loader, task, device, param_stats, ref_scale):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default=os.path.join(ROOT, "code", "configs", "default.json"))
-    parser.add_argument("--data_dir", default=os.path.join(ROOT, "datasets"))
+    parser.add_argument("--data_dir", default=os.path.join(ROOT, "datasets_official"),
+                        help="官方预处理目录（datasets_official/）或模拟数据目录（datasets/）")
     parser.add_argument("--out_dir", default=os.path.join(ROOT, "weights"))
     parser.add_argument("--from_mae", default=None,
                         help="MAE 预训练权重路径（缺省则用 out_dir/mae_pretrained.pt，不存在则从零开始）")
+    parser.add_argument("--smoke_steps", type=int, default=None,
+                        help="冒烟测试：每 epoch 限制优化步数（跳过验证集评估）")
     args = parser.parse_args()
 
     with open(args.config, "r", encoding="utf-8") as f:
@@ -130,6 +133,8 @@ def main():
         # ---- 三任务轮转训练（同一 optimizer，共享 backbone）----
         iters = {t: iter(loaders["train"][t]) for t in TASKS}
         n_steps = max(len(loaders["train"][t]) for t in TASKS)
+        if args.smoke_steps:
+            n_steps = min(n_steps, args.smoke_steps)
         for step in range(n_steps):
             for t in TASKS:
                 try:
@@ -159,6 +164,9 @@ def main():
         logger.info(f"epoch {ep+1}/{epochs}  loss[{msg}]")
 
         # ---- 验证 ----
+        if args.smoke_steps:
+            logger.info("smoke mode: skip evaluation")
+            break
         if (ep + 1) % 5 == 0 or ep == epochs - 1:
             evals = {t: evaluate(model, loaders["val"][t], t, device, param_stats, ref_scale)
                      for t in TASKS}

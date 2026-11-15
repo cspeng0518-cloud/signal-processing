@@ -51,22 +51,26 @@ def load_model(weights_dir, device):
 
 @torch.no_grad()
 def infer_file(model, parquet_path, out_path, seq_len, param_stats, device, batch_size=32):
-    """官方输入（混合三任务）-> JSONL。
+    """官方输入（混合三任务，行序任意混排）-> JSONL。
 
-    按行分批处理；批内行序即输出顺序，与官方 expected_output 对齐。
+    批内按 task 分组前向；输出严格保持输入行序（与官方 expected_output 对齐）。
     parameter 样本由 parameter_pattern 头决定模式：
       通信(前3参有效) -> 后4参填 0.0；雷达(后4参有效) -> 前3参填 0.0
     """
     df = pd.read_parquet(parquet_path)
-    os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+    out_dir = os.path.dirname(os.path.abspath(out_path))
+    os.makedirs(out_dir, exist_ok=True)
 
-    with open(out_path, "w", encoding="utf-8") as fout:
-        for s in range(0, len(df), batch_size):
-            chunk = df.iloc[s : s + batch_size]
-            iqs = [to_iq_array(v, seq_len) for v in chunk["iq"]]
+    # 结果按全局行号存放，最后顺序写出
+    results = [None] * len(df)
+    for s in range(0, len(df), batch_size):
+        chunk = df.iloc[s : s + batch_size]
+        # 同批内按 task 分组前向（批内行序不再要求一致）
+        for task, idx in chunk.groupby("task").indices.items():
+            rows = chunk.iloc[idx]
+            iqs = [to_iq_array(v, seq_len) for v in rows["iq"]]
             iq = torch.from_numpy(np.stack(iqs)).to(device)
-            sr = torch.full((len(chunk),), FS, dtype=torch.float32, device=device)
-            task = chunk["task"].iloc[0]
+            sr = torch.full((len(rows),), FS, dtype=torch.float32, device=device)
 
             out = model(iq, sr, task)
             if task == "parameter":
@@ -78,21 +82,25 @@ def infer_file(model, parquet_path, out_path, seq_len, param_stats, device, batc
                 pred = (out * mask).cpu().numpy()
                 if param_stats is not None:  # 反归一化 -> 原始 SI 单位
                     pred = pred * (param_stats["max"] - param_stats["min"]) + param_stats["min"]
-                for j in range(len(chunk)):
-                    p = {n: float(pred[j, k]) for k, n in enumerate(PARAM_NAMES)}
-                    fout.write(json.dumps({
+                for j, (_, row) in enumerate(rows.iterrows()):
+                    results[s + int(idx[j])] = {
                         "task": task,
-                        "sample_id": chunk["sample_id"].iloc[j],
-                        "prediction": p,
-                    }, ensure_ascii=False) + "\n")
+                        "sample_id": row["sample_id"],
+                        "prediction": {n: float(pred[j, k])
+                                       for k, n in enumerate(PARAM_NAMES)},
+                    }
             else:
                 ids = out.argmax(-1).cpu().numpy()
-                for j in range(len(chunk)):
-                    fout.write(json.dumps({
+                for j, (_, row) in enumerate(rows.iterrows()):
+                    results[s + int(idx[j])] = {
                         "task": task,
-                        "sample_id": chunk["sample_id"].iloc[j],
+                        "sample_id": row["sample_id"],
                         "prediction": ID2LABEL[task][int(ids[j])],
-                    }, ensure_ascii=False) + "\n")
+                    }
+
+    with open(out_path, "w", encoding="utf-8") as fout:
+        for r in results:
+            fout.write(json.dumps(r, ensure_ascii=False) + "\n")
     print(f"[infer] {parquet_path} -> {out_path} ({len(df)} samples)")
 
 
