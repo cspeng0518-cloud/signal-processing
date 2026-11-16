@@ -14,13 +14,14 @@ from pathlib import Path
 
 import torch
 from safetensors.torch import save_file
+from torch.utils.tensorboard import SummaryWriter
 
 from training.common import ROOT
 from training.tasks import TASKS, TASK_ORDER
 from utils.checkpoint import load_checkpoint, save_checkpoint
 from utils.dataset import save_param_stats
-from utils.logger import record_metrics
-from utils.train_utils import autocast_context, build_scheduler, optimizer_step
+from utils.logger import plot_metrics, record_metrics
+from utils.train_utils import autocast_context, build_scheduler, optimizer_step, tqdm
 
 
 # ================================================================ 导出
@@ -60,7 +61,8 @@ class BaseTrainer(ABC):
 
     def __init__(self, cfg, model, device, logger, out_dir,
                  resume=None, smoke_steps=0):
-        self.cfg = cfg
+        self.cfg = cfg                      # 完整配置（导出 config.json 用）
+        self.tcfg = cfg["training"]         # 训练参数（optimizer/scheduler/epoch 等）
         self.model = model
         self.device = device
         self.logger = logger
@@ -68,12 +70,19 @@ class BaseTrainer(ABC):
         self.smoke_steps = smoke_steps
         self.start_epoch = 0
         self.optimizer = torch.optim.AdamW(
-            self.train_parameters(), lr=cfg["lr"], weight_decay=cfg["weight_decay"])
+            self.train_parameters(), lr=self.tcfg["lr"],
+            weight_decay=self.tcfg["weight_decay"])
         self.scheduler = build_scheduler(
             self.optimizer, self.scheduler_total_steps(),
-            cfg.get("warmup_ratio", 0.1))
+            self.tcfg.get("warmup_ratio", 0.1))
+        # bf16 混合精度无需 loss scaling（GradScaler 仅 fp16 需要）；
+        # 保留 scaler 对象以维持 optimizer_step / 断点保存接口不变（enabled=False 时透传）
         self.scaler = torch.amp.GradScaler(
-            "cuda", enabled=(device.type == "cuda" and cfg.get("amp", True)))
+            "cuda", enabled=(device.type == "cuda" and self.tcfg.get("amp_dtype") == "fp16"))
+        # TensorBoard 可视化（train/loss、train/grad_norm、train/lr 等；tag 区分阶段）
+        self.global_step = 0
+        self._epoch = 0
+        self.writer = SummaryWriter(log_dir=str(ROOT / "logs" / "tb" / self.tag))
         if resume:
             self.start_epoch, extra = load_checkpoint(
                 resume, model=model, optimizer=self.optimizer,
@@ -112,24 +121,46 @@ class BaseTrainer(ABC):
     def on_finish(self):
         pass
 
+    # ---------------- 可视化 ----------------
+    def _log_scalars(self, values):
+        """step 级指标写 TensorBoard（train/loss、train/grad_norm、train/lr）。"""
+        for k, v in values.items():
+            self.writer.add_scalar(k, v, self.global_step)
+
+    def _log_epoch(self, values, epoch):
+        """epoch 级指标写 TensorBoard（epoch/ 前缀；jsonl 由 record_metrics 落盘）。"""
+        for k, v in values.items():
+            if isinstance(v, (int, float)):
+                self.writer.add_scalar(f"epoch/{k}", v, epoch)
+        self.writer.flush()
+
     # ---------------- 生命周期 ----------------
     def fit(self):
-        for epoch in range(self.start_epoch, self.n_epochs()):
-            values = self.train_one_epoch()
-            values["lr"] = self.scheduler.get_last_lr()[0]
-            values.update(self.on_epoch_end(epoch))
-            record_metrics(ROOT / "logs", self.tag, epoch + 1, values)
-            self.logger.info("epoch=%d %s", epoch + 1,
-                             " ".join(f"{k}={v:.5f}" for k, v in values.items()))
-            save_checkpoint(self.out_dir / self.resume_name, epoch=epoch,
-                            model=self.model, optimizer=self.optimizer,
-                            scheduler=self.scheduler, scaler=self.scaler,
-                            **self.checkpoint_extra())
-            if self.smoke_steps:
-                break
-            if self.should_stop():
-                self.logger.info("early stopping at epoch %d", epoch + 1)
-                break
+        try:
+            for epoch in range(self.start_epoch, self.n_epochs()):
+                self._epoch = epoch
+                values = self.train_one_epoch()
+                values["lr"] = self.scheduler.get_last_lr()[0]
+                values.update(self.on_epoch_end(epoch))
+                record_metrics(ROOT / "logs", self.tag, epoch + 1, values)
+                self.logger.info("epoch=%d %s", epoch + 1,
+                                 " ".join(f"{k}={v:.5f}" for k, v in values.items()))
+                self._log_epoch(values, epoch + 1)
+                save_checkpoint(self.out_dir / self.resume_name, epoch=epoch,
+                                model=self.model, optimizer=self.optimizer,
+                                scheduler=self.scheduler, scaler=self.scaler,
+                                **self.checkpoint_extra())
+                if self.smoke_steps:
+                    break
+                if self.should_stop():
+                    self.logger.info("early stopping at epoch %d", epoch + 1)
+                    break
+        finally:
+            self.writer.close()
+        # 训练结束后自动绘制指标曲线图（logs/plots/<tag>_<group>.png）
+        for png in plot_metrics(ROOT / "logs" / f"{self.tag}_metrics.jsonl",
+                                ROOT / "logs" / "plots", self.tag):
+            self.logger.info("plot saved: %s", png)
         self.on_finish()
 
 
@@ -154,30 +185,40 @@ class MAEPretrainer(BaseTrainer):
                 if not name.startswith("task_heads")]
 
     def n_epochs(self):
-        return self.cfg["epochs_pretrain"]
+        return self.tcfg["epochs_pretrain"]
 
     def scheduler_total_steps(self):
         steps = len(self.loader)
         if self.smoke_steps:
             steps = min(steps, self.smoke_steps)
-        return max(1, steps * self.cfg["epochs_pretrain"])
+        return max(1, steps * self.tcfg["epochs_pretrain"])
 
     def train_one_epoch(self):
         self.model.train()
         total, count = 0.0, 0
-        for step, (iq, sr) in enumerate(self.loader):
+        norms = []
+        desc = f"pretrain epoch {self._epoch + 1}/{self.n_epochs()}"
+        for step, (iq, sr) in enumerate(tqdm(self.loader, desc=desc,
+                                             leave=False, dynamic_ncols=True)):
             if self.smoke_steps and step >= self.smoke_steps:
                 break
             iq, sr = iq.to(self.device), sr.to(self.device)
-            with autocast_context(self.device, self.cfg.get("amp", True)):
+            with autocast_context(self.device, self.tcfg.get("amp", True)):
                 recon, target = self.model.forward_mae(iq, sr)
                 loss = (recon.float() - target.float()).square().mean()
-            optimizer_step(loss, self.optimizer, self.model, self.scaler,
-                           self.cfg.get("grad_clip", 1.0))
+            grad_norm = optimizer_step(loss, self.optimizer, self.model, self.scaler,
+                                       self.tcfg.get("grad_clip", 1.0))
             self.scheduler.step()
-            total += loss.item() * iq.size(0)
+            loss_v = loss.item()
+            total += loss_v * iq.size(0)
             count += iq.size(0)
-        return {"recon_mse": total / max(1, count)}
+            norms.append(grad_norm)
+            self.global_step += 1
+            self._log_scalars({"train/loss": loss_v,
+                               "train/grad_norm": grad_norm,
+                               "train/lr": self.scheduler.get_last_lr()[0]})
+        return {"recon_mse": total / max(1, count),
+                "grad_norm": sum(norms) / max(1, len(norms))}
 
     def on_finish(self):
         export_pretrained(self.model, self.out_dir)
@@ -195,13 +236,14 @@ class MultitaskFinetuner(BaseTrainer):
                  resume=None, smoke_steps=0):
         self.loaders = loaders
         self.param_stats = param_stats
-        self.weights = cfg.get("task_weights",
-                               {"protocol": 0.3, "modulation": 0.3, "parameter": 0.4})
+        # tcfg 在 super().__init__ 才就位，此处直接读 training 子配置
+        self.weights = cfg["training"].get("task_weights",
+                                           {"protocol": 0.3, "modulation": 0.3, "parameter": 0.4})
         self.best, self.bad = -float("inf"), 0  # 须在 super().__init__ 前（resume 依赖）
         super().__init__(cfg, model, device, logger, out_dir, resume, smoke_steps)
 
     def n_epochs(self):
-        return self.cfg["epochs_finetune"]
+        return self.tcfg["epochs_finetune"]
 
     def steps_per_epoch(self):
         steps = max(len(self.loaders["train"][t]) for t in TASK_ORDER)
@@ -210,36 +252,46 @@ class MultitaskFinetuner(BaseTrainer):
     def scheduler_total_steps(self):
         # 每步依次更新三个任务 -> 每 epoch 优化步数 = steps * len(TASK_ORDER)
         return max(1, self.steps_per_epoch() * len(TASK_ORDER)
-                   * self.cfg["epochs_finetune"])
+                   * self.tcfg["epochs_finetune"])
 
     def train_one_epoch(self):
         self.model.train()
         n_steps = self.steps_per_epoch()
         iters = {t: iter(self.loaders["train"][t]) for t in TASK_ORDER}
         losses = {t: 0.0 for t in TASK_ORDER}
-        for _ in range(n_steps):
+        norms = []
+        desc = f"finetune epoch {self._epoch + 1}/{self.n_epochs()}"
+        for _ in tqdm(range(n_steps), desc=desc, leave=False, dynamic_ncols=True):
             for task in TASK_ORDER:
                 batch = next_batch(iters, self.loaders["train"], task)
                 batch = {k: v.to(self.device) for k, v in batch.items()}
-                with autocast_context(self.device, self.cfg.get("amp", True)):
+                with autocast_context(self.device, self.tcfg.get("amp", True)):
                     feat = self.model.encode(batch["iq"], batch["sr"])
-                    loss = TASKS[task].loss(self.model, feat, batch, self.cfg)
+                    loss = TASKS[task].loss(self.model, feat, batch, self.tcfg)
                     loss = loss * float(self.weights[task])
-                optimizer_step(loss, self.optimizer, self.model, self.scaler,
-                               self.cfg.get("grad_clip", 1.0))
+                grad_norm = optimizer_step(loss, self.optimizer, self.model, self.scaler,
+                                           self.tcfg.get("grad_clip", 1.0))
                 self.scheduler.step()
-                losses[task] += loss.item()
-        return {f"train_{t}_weighted_loss": losses[t] / max(1, n_steps)
-                for t in TASK_ORDER}
+                loss_v = loss.item()
+                losses[task] += loss_v
+                norms.append(grad_norm)
+                self.global_step += 1
+                self._log_scalars({f"train/loss_{task}": loss_v,
+                                   "train/grad_norm": grad_norm,
+                                   "train/lr": self.scheduler.get_last_lr()[0]})
+        values = {f"train_{t}_weighted_loss": losses[t] / max(1, n_steps)
+                  for t in TASK_ORDER}
+        values["grad_norm"] = sum(norms) / max(1, len(norms))
+        return values
 
     def on_epoch_end(self, epoch):
-        if self.smoke_steps or (epoch + 1) % self.cfg.get("eval_every", 1) != 0:
+        if self.smoke_steps or (epoch + 1) % self.tcfg.get("eval_every", 1) != 0:
             return {}
         if any(t not in self.loaders.get("val", {}) for t in TASK_ORDER):
             raise RuntimeError("missing validation split for one or more tasks")
         results = {t: TASKS[t].evaluate(self.model, self.loaders["val"][t],
                                         self.device, self.param_stats,
-                                        self.cfg.get("ref_scale", 0.5))
+                                        self.tcfg.get("ref_scale", 0.5))
                    for t in TASK_ORDER}
         values = {f"val_{t}_{k}": v for t, m in results.items() for k, v in m.items()}
         score = (0.3 * results["protocol"]["acc"]
@@ -262,7 +314,7 @@ class MultitaskFinetuner(BaseTrainer):
         self.bad = extra.get("bad", 0)
 
     def should_stop(self):
-        return self.bad >= self.cfg.get("patience", 7)
+        return self.bad >= self.tcfg.get("patience", 7)
 
     def on_finish(self):
         if self.smoke_steps:

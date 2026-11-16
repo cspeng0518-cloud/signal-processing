@@ -24,15 +24,15 @@ ROOT = os.path.abspath(os.path.dirname(__file__))  # code/
 sys.path.insert(0, ROOT)
 
 from models import EMFoundation
+from training.common import load_config  # 归一化新旧配置格式 -> {"model","training"}
 from utils.dataset import to_iq_array, PARAM_NAMES, ID2LABEL, FS
 from utils.logger import get_logger
 
 
 def load_model(weights_dir, device):
     """加载 weights/ 下的 model.safetensors + config.json + param_stats.json"""
-    with open(os.path.join(weights_dir, "config.json"), "r", encoding="utf-8") as f:
-        cfg = json.load(f)
-    model = EMFoundation(cfg).to(device)
+    cfg = load_config(os.path.join(weights_dir, "config.json"))
+    model = EMFoundation(cfg["model"]).to(device)
     from safetensors.torch import load_file
     sd = load_file(os.path.join(weights_dir, "model.safetensors"))
     sd = {(k[len("model."):] if k.startswith("model.") else k): v for k, v in sd.items()}
@@ -124,7 +124,7 @@ def main():
     logger = get_logger("inference", os.path.join(ROOT,"..","logs"), "inference.log")
     start = time.perf_counter()
     infer_file(model, args.input, args.output,
-               seq_len=cfg.get("seq_len", 1024), param_stats=param_stats,
+               seq_len=cfg["training"].get("seq_len", 1024), param_stats=param_stats,
                device=device, batch_size=args.batch_size)
     logger.info("device=%s input=%s output=%s elapsed_s=%.3f",device,args.input,args.output,time.perf_counter()-start)
 

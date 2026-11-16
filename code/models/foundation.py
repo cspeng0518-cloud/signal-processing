@@ -1,7 +1,7 @@
 """电磁通用感知基座模型组装（对应赛题任务1/2/3）
 
 EMFoundation = IQTokenizer（时域分支）
-             + 共享 Backbone（Transformer/Mamba 可选）
+             + 共享 Backbone（Transformer / Hybrid(MLA+GDA+Mamba) / Mamba 可选）
              + 三个任务头（体制/调制/参数）
 
 权重共用核算（赛题红线 >80%）：
@@ -54,6 +54,9 @@ class MAEDecoder(nn.Module):
         return self.proj(self.decoder(x))
 
 class EMFoundation(nn.Module):
+    """接收配置的 model 部分（{"model": {...}} 的内层 dict，
+    由 training/common.normalize_config 保证新旧格式归一）。"""
+
     def __init__(self, config: dict):
         super().__init__()
         self.config = config
@@ -75,6 +78,14 @@ class EMFoundation(nn.Module):
             nhead=config.get("nhead", 4),
             pos_encoding=pos_encoding,
             rope_max_len=rope_max_len,
+            # MLP 通道维（ffn_hidden 未配置时各 backbone 用默认 4*d_model）
+            dim_feedforward=config.get("ffn_hidden", 4 * d_model),
+            # hybrid backbone 专属参数（其余 backbone 在工厂内弹出不感知）；
+            # layer_types 为 GLM-5.2 式逐层列表，hybrid_layers 为旧键名
+            layer_types=config.get("layer_types",
+                                   config.get("hybrid_layers", ["mla", "gda", "mamba"])),
+            mla_kv_lora_rank=config.get("mla_kv_lora_rank", 32),
+            mla_q_lora_rank=config.get("mla_q_lora_rank", 32),
         )
         # ---- MAE 预训练专用 ----
         self.mae_decoder = MAEDecoder(

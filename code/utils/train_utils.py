@@ -3,6 +3,7 @@ import math
 import random
 import numpy as np
 import torch
+from tqdm import tqdm  # 进度条（训练可视化，固定依赖）
 
 
 def seed_all(seed=42):
@@ -20,7 +21,11 @@ def get_device():
 
 
 def autocast_context(device, enabled=True):
-    return torch.autocast(device_type=device.type, dtype=torch.float16 if device.type == "cuda" else torch.bfloat16,
+    """bf16 混合精度 autocast（预训练后量化友好，无 CUDA 专有算子）。
+
+    bf16 动态范围与 fp32 同阶，无需梯度缩放；NPU/CUDA 均原生支持。
+    """
+    return torch.autocast(device_type=device.type, dtype=torch.bfloat16,
                           enabled=bool(enabled and device.type in ("cuda", "npu")))
 
 
@@ -35,9 +40,11 @@ def build_scheduler(optimizer, total_steps, warmup_ratio=0.1):
 
 
 def optimizer_step(loss, optimizer, model, scaler, clip):
+    """反向 + 裁剪 + 优化器步进，返回裁剪前的全局梯度范数（供监控）。"""
     optimizer.zero_grad(set_to_none=True)
     scaler.scale(loss).backward()
     scaler.unscale_(optimizer)
-    torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
+    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
     scaler.step(optimizer)
     scaler.update()
+    return float(grad_norm)

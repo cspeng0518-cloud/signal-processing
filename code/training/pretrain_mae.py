@@ -63,12 +63,12 @@ def build_pretrain_loader(data_dir, cfg, device, logger):
 def main():
     args = base_arg_parser("MAE self-supervised pretraining").parse_args()
     cfg = load_config(args.config)
-    seed_all(cfg.get("seed", 42))
+    seed_all(cfg["training"].get("seed", 42))
     device = get_device()
     logger = get_logger("pretrain", ROOT / "logs")
 
-    loader = build_pretrain_loader(args.data_dir, cfg, device, logger)
-    model = EMFoundation(cfg).to(device)
+    loader = build_pretrain_loader(args.data_dir, cfg["training"], device, logger)
+    model = EMFoundation(cfg["model"]).to(device)
     MAEPretrainer(cfg, model, device, logger, out_dir=args.out_dir, loader=loader,
                   resume=args.resume, smoke_steps=args.smoke_steps).fit()
 

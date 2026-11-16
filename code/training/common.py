@@ -1,7 +1,8 @@
 """两阶段训练脚本（pretrain_mae / finetune_multitask）共享的脚手架：
 
-  - base_arg_parser: 统一命令行参数
-  - load_config:      读取 JSON 配置
+  - base_arg_parser:   统一命令行参数
+  - normalize_config:  新旧配置格式归一化 -> {"model": ..., "training": ...}
+  - load_config:       读取 JSON 配置（自动归一化）
   - load_mae_pretrained: 加载 MAE 预训练共享权重（微调用）
   - ROOT / CODE_ROOT: 目录常量
 """
@@ -15,6 +16,26 @@ import torch
 # code/training/common.py -> parents[1]=code/, parents[2]=仓库根
 CODE_ROOT = Path(__file__).resolve().parents[1]
 ROOT = CODE_ROOT.parent
+
+# 归属 model 部分的键（其余键一律归 training，兼容旧扁平配置的未知训练参数）
+_MODEL_KEYS = {
+    "backbone", "d_model", "n_layers", "nhead", "ffn_hidden", "patch_size",
+    "sr_bins", "pos_encoding", "mask_ratio", "mae_decoder_layers", "head_hidden",
+    "use_frequency", "layer_types", "hybrid_layers",
+    "mla_kv_lora_rank", "mla_q_lora_rank",
+}
+
+
+def normalize_config(cfg):
+    """配置格式归一化：输出恒为 {"model": {...}, "training": {...}}。
+
+    - 新格式（含 "model"/"training" 顶层键）: 直接透传，缺失部分补空 dict
+    - 旧版扁平格式: 按 _MODEL_KEYS 拆分为 model / training 两部分
+    """
+    if "model" in cfg or "training" in cfg:
+        return {"model": cfg.get("model", {}), "training": cfg.get("training", {})}
+    return {"model": {k: v for k, v in cfg.items() if k in _MODEL_KEYS},
+            "training": {k: v for k, v in cfg.items() if k not in _MODEL_KEYS}}
 
 
 def base_arg_parser(description):
@@ -34,8 +55,9 @@ def base_arg_parser(description):
 
 
 def load_config(path):
+    """读取 JSON 配置并归一化为 {"model": ..., "training": ...}。"""
     with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+        return normalize_config(json.load(f))
 
 
 def load_mae_pretrained(model, path, logger=None):

@@ -45,20 +45,21 @@ def main():
     args = parser.parse_args()
 
     cfg = load_config(args.config)
-    seed_all(cfg.get("seed", 42))
+    train_cfg = cfg["training"]
+    seed_all(train_cfg.get("seed", 42))
     device = get_device()
     logger = get_logger("finetune", ROOT / "logs")
 
     # ---- 数据 ----
     loaders, param_stats = build_task_dataloaders(
-        args.data_dir, batch_size=cfg["batch_size"], seq_len=cfg["seq_len"],
-        num_workers=cfg.get("num_workers", 0))
+        args.data_dir, batch_size=train_cfg["batch_size"], seq_len=train_cfg["seq_len"],
+        num_workers=train_cfg.get("num_workers", 0))
     missing = [t for t in TASK_ORDER if t not in loaders["train"]]
     if missing:
         raise RuntimeError(f"missing required train tasks: {missing}")
 
     # ---- 模型 ----
-    model = EMFoundation(cfg).to(device)
+    model = EMFoundation(cfg["model"]).to(device)
     shared, total = assert_competition_limits(model)
     logger.info("device=%s shared_ratio=%.2f%% params=%d", device, shared * 100, total)
 

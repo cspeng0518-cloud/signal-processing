@@ -1,28 +1,27 @@
-"""基座 Backbone（参考 EMind V 节 + IFNet/nn/Transformer.py 风格）
+"""基座 Backbone（参考 EMind V 节风格）
 
 类层次（全部派生自 BaseEncoder，forward 接口完全一致，调用方零分支）:
   BaseEncoder                 抽象基类：统一 forward 契约与 MAE gather/scatter 公共逻辑
   ├── SinTransformerEncoder   绝对正弦位置编码 Transformer（PE 在 tokenizer 阶段叠加）
   ├── RoPETransformerEncoder  旋转位置编码 Transformer（q/k 在注意力内旋转）
-  └── MambaEncoder            选择性状态空间模型（需 mamba-ssm 包，可选依赖）
+  ├── MambaEncoder            选择性状态空间模型（纯 torch 原生实现，见 layers/mamba.py）
+  └── HybridEncoder           混合架构（full_attention/mla 按层排布，见 layers/hybrid.py）
 
 build_backbone 工厂在初始化时按 (backbone, pos_encoding) 配置选择实现；
-RoPEAttention / RoPEEncoderLayer 是 RoPETransformerEncoder 的内部组件。
+注意力组件（RoPEAttention / MLAAttention / RoPEEncoderLayer）见 layers/attention.py，
+混合层体系（BaseSequenceLayer 及其子类）见 layers/hybrid.py，
+Mamba block（纯 torch selective scan）见 layers/mamba.py。
 """
 
-import math
 from abc import ABC, abstractmethod
 
 import torch
 import torch.nn as nn
 
 from .tokenizer import RoPEPositionalEncoding  # RoPE cos/sin 旋转表（tokenizer.py 中定义）
-
-try:
-    from mamba_ssm import Mamba  # 可选依赖，未安装则 Mamba 不可用
-    HAS_MAMBA = True
-except ImportError:
-    HAS_MAMBA = False
+from .layers.attention import RoPEAttention, RoPEEncoderLayer  # 注意力组件
+from .layers.hybrid import build_sequence_layer, normalize_layer_type  # 混合层工厂与类型归一
+from .layers.mamba import MambaBlock  # 纯 torch 原生 Mamba（无 mamba_ssm 依赖）
 
 
 # ==================================================================== 基类
@@ -71,60 +70,6 @@ class BaseEncoder(nn.Module, ABC):
         return self.norm(self._encode(x, pos_ids=pos_ids))
 
 
-# ================================================ RoPE 内部组件
-class RoPEAttention(nn.Module):
-    """带 RoPE 的多头自注意力（eager 实现，无 CUDA 专有算子）。
-
-    q/k 经 rope.rotate() 按位置旋转后做标准缩放点积注意力。
-    nn.TransformerEncoderLayer 的注意力不可注入旋转，故此组件必须自实现，
-    但仅作为 RoPETransformerEncoder 的内部实现细节存在。
-    """
-
-    def __init__(self, d_model, nhead, dropout=0.0):
-        super().__init__()
-        self.nhead = nhead
-        self.head_dim = d_model // nhead
-        self.qkv = nn.Linear(d_model, 3 * d_model)
-        self.proj = nn.Linear(d_model, d_model)
-        self.attn_drop = nn.Dropout(dropout)
-        self.out_drop = nn.Dropout(dropout)
-
-    def forward(self, x, rope, pos_ids=None, key_padding_mask=None):
-        B, L, D = x.shape
-        q, k, v = self.qkv(x).chunk(3, dim=-1)
-        shape = (B, L, self.nhead, self.head_dim)
-        q = rope.rotate(q.view(shape), pos_ids)
-        k = rope.rotate(k.view(shape), pos_ids)
-        v = v.view(shape)
-        q, k, v = (t.transpose(1, 2) for t in (q, k, v))           # [B, H, L, Dh]
-
-        attn = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
-        if key_padding_mask is not None:                           # True = 忽略
-            attn = attn.masked_fill(key_padding_mask[:, None, None, :],
-                                    float("-inf"))
-        attn = self.attn_drop(attn.softmax(dim=-1))
-        out = (attn @ v).transpose(1, 2).reshape(B, L, D)
-        return self.out_drop(self.proj(out))
-
-
-class RoPEEncoderLayer(nn.Module):
-    """post-norm Transformer encoder layer（结构对齐 nn.TransformerEncoderLayer 默认）。"""
-
-    def __init__(self, d_model, nhead, dim_feedforward, dropout=0.1):
-        super().__init__()
-        self.attn = RoPEAttention(d_model, nhead, dropout)
-        self.norm1 = nn.LayerNorm(d_model)
-        self.ff = nn.Sequential(
-            nn.Linear(d_model, dim_feedforward), nn.GELU(), nn.Dropout(dropout),
-            nn.Linear(dim_feedforward, d_model), nn.Dropout(dropout),
-        )
-        self.norm2 = nn.LayerNorm(d_model)
-
-    def forward(self, x, rope, pos_ids=None, key_padding_mask=None):
-        x = self.norm1(x + self.attn(x, rope, pos_ids, key_padding_mask))
-        return self.norm2(x + self.ff(x))
-
-
 # ================================================================ 子类
 class SinTransformerEncoder(BaseEncoder):
     """绝对正弦位置编码 Transformer（默认）。
@@ -169,7 +114,7 @@ class RoPETransformerEncoder(BaseEncoder):
 
 
 class MambaEncoder(BaseEncoder):
-    """Mamba 状态空间 backbone（长序列线性复杂度，需 mamba-ssm 包）。
+    """Mamba 状态空间 backbone（长序列线性复杂度，纯 torch 原生实现）。
 
     序列模型无注意力：不支持任意位置掩码跳算（mask/pos_ids 被忽略），
     MAE keep_ids 路径由基类 gather 保证接口一致但无注意力级加速。
@@ -177,18 +122,59 @@ class MambaEncoder(BaseEncoder):
 
     def __init__(self, d_model=128, n_layers=12, d_state=16, expand=2):
         super().__init__(d_model)
-        if not HAS_MAMBA:
-            raise ImportError(
-                "mamba-ssm 未安装。安装: pip install mamba-ssm causal-conv1d，"
-                "或使用 backbone='transformer'"
-            )
         self.layers = nn.ModuleList(
-            [Mamba(d_model=d_model, d_state=d_state, expand=expand) for _ in range(n_layers)]
+            [MambaBlock(d_model=d_model, d_state=d_state, expand=expand)
+             for _ in range(n_layers)]
         )
 
     def _encode(self, x, pos_ids=None, key_padding_mask=None):
         for layer in self.layers:
             x = layer(x)
+        return x
+
+
+class HybridEncoder(BaseEncoder):
+    """混合架构编码器（Jamba / Qwen3-Next / GLM-5.2 式）：按 layer_types 逐层堆叠异构层。
+
+    layer_types 显式声明每层的 token 混合器（对齐 GLM-5.2 config 的
+    indexer_types / mlp_layer_types 逐层列表风格）:
+      "full_attention"  标准全局注意力（精确检索）
+      "mla"/"gda"/"mamba" sparse attn（KV 压缩 / 线性注意力 / SSM，长程线性复杂度）
+    列表长度等于 n_layers 时逐层精确对应；短于 n_layers 时按模式串循环铺满
+    （兼容旧 hybrid_layers 模式串写法）；长于 n_layers 报错。
+
+    层级多态见 layers/hybrid.py（BaseSequenceLayer + build_sequence_layer 工厂），
+    本类只持有共享 RoPE 旋转表并逐层调用，无任何层类型分支。
+
+    注意力类层（full_attention/mla）依赖 RoPE，GDA/Mamba 层位置无关——因此
+    hybrid backbone 必须搭配 pos_encoding='rope'（tokenizer 不叠加绝对位置编码）。
+    """
+
+    def __init__(self, d_model=128, n_layers=12, nhead=4, layer_types=None,
+                 dim_feedforward=None, dropout=0.1, rope_max_len=512,
+                 mla_kv_lora_rank=32, mla_q_lora_rank=32):
+        super().__init__(d_model)
+        if not layer_types:
+            raise ValueError(
+                "hybrid backbone 需要非空 layer_types 列表，"
+                "如 ['full_attention','mla','gda','mamba']（长度不足 n_layers 时循环铺满）")
+        types = [normalize_layer_type(t) for t in layer_types]
+        if len(types) > n_layers:
+            raise ValueError(
+                f"layer_types 长度 {len(types)} 超过 n_layers={n_layers}，"
+                "请提供精确逐层列表或短模式串（自动循环铺满）")
+        self.rope = RoPEPositionalEncoding(d_model, nhead, max_len=rope_max_len)
+        pattern = [types[i % len(types)] for i in range(n_layers)]
+        self.layers = nn.ModuleList(
+            [build_sequence_layer(t, d_model, nhead,
+                                  dim_feedforward=dim_feedforward, dropout=dropout,
+                                  mla_kv_lora_rank=mla_kv_lora_rank,
+                                  mla_q_lora_rank=mla_q_lora_rank)
+             for t in pattern])
+
+    def _encode(self, x, pos_ids=None, key_padding_mask=None):
+        for layer in self.layers:
+            x = layer(x, self.rope, pos_ids, key_padding_mask)
         return x
 
 
@@ -203,15 +189,30 @@ def build_backbone(name="transformer", **kwargs):
     """
     name = name.lower()
     pos_encoding = kwargs.pop("pos_encoding", "sin")
+    # hybrid 专属参数统一弹出，仅 hybrid 分支消费（其余实现不感知）；
+    # hybrid_layers 为旧配置键名，归一为 layer_types（两键并存时以新键为准）
+    hybrid_kwargs = {k: kwargs.pop(k) for k in
+                     ("layer_types", "hybrid_layers", "mla_kv_lora_rank", "mla_q_lora_rank")
+                     if k in kwargs}
+    legacy = hybrid_kwargs.pop("hybrid_layers", None)
+    if "layer_types" not in hybrid_kwargs and legacy is not None:
+        hybrid_kwargs["layer_types"] = legacy
     if name == "transformer":
         if pos_encoding not in _TRANSFORMERS:
             raise ValueError(
                 f"未知 pos_encoding: {pos_encoding}，可选 {sorted(_TRANSFORMERS)}")
         return _TRANSFORMERS[pos_encoding](**kwargs)
+    if name == "hybrid":
+        if pos_encoding != "rope":
+            raise ValueError("hybrid backbone 为 RoPE 原生（full_attention/mla 层需旋转位置），"
+                             "请设置 pos_encoding='rope'")
+        kwargs.update(hybrid_kwargs)
+        return HybridEncoder(**kwargs)
     if name == "mamba":
         if pos_encoding == "rope":
             raise ValueError("Mamba 不支持 RoPE（序列模型无注意力），请用 pos_encoding='sin'")
         kwargs.pop("nhead", None)          # Mamba 无多头概念，忽略
         kwargs.pop("rope_max_len", None)   # 位置编码由 tokenizer 承担，忽略
+        kwargs.pop("dim_feedforward", None)  # Mamba block 自带扩展投影，无外加 FFN
         return MambaEncoder(**kwargs)
-    raise ValueError(f"未知 backbone: {name}，可选 'transformer' | 'mamba'")
+    raise ValueError(f"未知 backbone: {name}，可选 'transformer' | 'hybrid' | 'mamba'")
