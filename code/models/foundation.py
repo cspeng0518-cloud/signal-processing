@@ -123,26 +123,40 @@ class EMFoundation(nn.Module):
         return ids
 
     def forward_mae(self, iq, sr):
-        """真正的 masked reconstruction：编码可见 patch，解码并仅监督遮蔽 patch。"""
-        tokens, n_patch = self.tokenizer(iq, sr)
+        """标准 MAE 前向：只编码可见 token，解码端为掩码位置插入可学习 mask token，
+        仅对被掩码 patch 计算重建损失。
+
+        Returns:
+            recon:  [B, n_masked, 2*patch_size] 被掩码 patch 的重建值
+            target: [B, n_masked, 2*patch_size] 被掩码 patch 的归一化原始值
+        """
+        tokens, n_patch = self.tokenizer(iq, sr)  # token 已含位置编码
         B, _, D = tokens.shape
-        keep_patch = self._random_mask(n_patch, B, tokens.device) - 2
-        visible_index = torch.cat([
-            torch.arange(2, device=iq.device).unsqueeze(0).expand(B, -1), keep_patch + 2], dim=1)
-        visible = torch.gather(tokens, 1, visible_index.unsqueeze(-1).expand(-1,-1,D))
+
+        # ---- 1. 采样掩码，收集可见 token（CLS/SR 永不掩码）----
+        keep_patch = self._random_mask(n_patch, B, tokens.device) - 2   # [B,K] patch 下标
+        visible_index = torch.cat(
+            [torch.arange(2, device=tokens.device).unsqueeze(0).expand(B, -1),
+             keep_patch + 2], dim=1)                                     # [B,K+2] token 下标
+        visible = torch.gather(tokens, 1, visible_index.unsqueeze(-1).expand(-1, -1, D))
         if self.use_frequency:
-            freq = self.frequency_tokenizer(iq)
-            visible = self.cross_domain_fusion(visible, freq)
-        encoded = self.backbone(visible)
-        # 遮蔽位置只使用 learned mask token + positional encoding，绝不泄露原始 patch
-        dec = self.mask_token.expand(B, n_patch + 2, D).clone()
-        dec.scatter_(1, visible_index.unsqueeze(-1).expand(-1,-1,D), encoded)
-        dec = self.tokenizer.pos_encoding(dec)
-        reconstructed = self.mae_decoder(dec)[:, 2:]
-        target = self.tokenizer.to_patches(self.tokenizer.normalize(iq))
-        masked = torch.ones(B, n_patch, device=iq.device, dtype=torch.bool)
+            visible = self.cross_domain_fusion(visible, self.frequency_tokenizer(iq))
+        encoded = self.backbone(visible)  # 仅编码可见 token（MAE 加速路径）
+
+        # ---- 2. 解码端全序列：可见位用 encoded，掩码位用 mask token ----
+        # encoded 已含 tokenizer 阶段的位置编码，因此只给 mask token 补位置编码，
+        # 避免可见 token 被重复叠加两次位置编码。
+        pos = self.tokenizer.pos_encoding.pe[:, : n_patch + 2]           # [1,L,D]
+        dec = self.mask_token.expand(B, n_patch + 2, D).clone() + pos    # 掩码位
+        dec.scatter_(1, visible_index.unsqueeze(-1).expand(-1, -1, D), encoded)
+        reconstructed = self.mae_decoder(dec)[:, 2:]                     # 丢掉 CLS/SR 位
+
+        # ---- 3. 仅监督被掩码 patch ----
+        target = self.tokenizer.to_patches(self.tokenizer.normalize(iq))  # [B,P,2*ps]
+        masked = torch.ones(B, n_patch, device=tokens.device, dtype=torch.bool)
         masked.scatter_(1, keep_patch, False)
-        return reconstructed[masked].reshape(B, -1, target.size(-1)), target[masked].reshape(B, -1, target.size(-1))
+        return (reconstructed[masked].reshape(B, -1, target.size(-1)),
+                target[masked].reshape(B, -1, target.size(-1)))
 
     # ------------------------------------------------------------------
     def encode(self, iq, sr):

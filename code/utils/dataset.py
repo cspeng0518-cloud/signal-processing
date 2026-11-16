@@ -239,6 +239,11 @@ def make_task_dataset(data_dir, task, split="train", seq_len=1024, param_stats=N
     pq_path = os.path.join(data_dir, f"{split}_{task}.parquet")
     if os.path.exists(pq_path):
         return EMSignalDataset(pq_path, task, seq_len, param_stats)
+    # 兼容旧模拟数据命名：protocol 任务旧名为 system（EMSignalDataset 内部已做映射）
+    if task == "protocol":
+        legacy_path = os.path.join(data_dir, f"{split}_system.parquet")
+        if os.path.exists(legacy_path):
+            return EMSignalDataset(legacy_path, task, seq_len, param_stats)
     raise FileNotFoundError(f"no dataset for task={task}, split={split} under {data_dir}")
 
 
@@ -278,7 +283,7 @@ def compute_param_stats(parquet_path):
 
 
 def build_task_dataloaders(data_dir, batch_size=32, seq_len=1024, splits=("train", "val"),
-                           tasks=("protocol", "modulation", "parameter")):
+                           tasks=("protocol", "modulation", "parameter"), num_workers=0):
     """构建多任务 DataLoader 字典
 
     优先使用预处理 memmap 布局（{task}/iq.memap + meta.json，val 划分在 meta 内），
@@ -307,7 +312,7 @@ def build_task_dataloaders(data_dir, batch_size=32, seq_len=1024, splits=("train
                 continue
             loaders[split][task] = DataLoader(
                 ds, batch_size=batch_size, shuffle=(split == "train"),
-                collate_fn=collate_fn, num_workers=0,
+                collate_fn=collate_fn, num_workers=num_workers,
             )
     return loaders, param_stats
 
