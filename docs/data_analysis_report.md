@@ -1,7 +1,7 @@
 # 官方真实数据集分析报告（rf_signal_benchmark_train_v1.0）
 
 > 分析工具：`utils/analyze_real.py`（全量扫描 1,179,000 行）
-> 统计明细：`files/real_data_stats.json`
+> 统计明细：`docs/real_data_stats.json`
 > 统计图：`figures/real_analysis/`，样本图：`figures/real_samples/`
 > 日期：2026-11-15
 

@@ -55,7 +55,7 @@ LABEL2ID = {
 }
 ID2LABEL = {t: {i: c for c, i in m.items()} for t, m in LABEL2ID.items()}
 
-# ---- 官方全量统计 (1,179,000 行, files/real_data_stats.json, SI 单位) ----
+# ---- 官方全量统计 (1,179,000 行, docs/real_data_stats.json, SI 单位) ----
 DEFAULT_PARAM_STATS = {
     "min": np.array([62.5, 65.0, -50.0,
                      1.0000078873417806e-05, 1.7000029401970096e-05,

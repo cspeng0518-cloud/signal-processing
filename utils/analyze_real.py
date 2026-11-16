@@ -4,7 +4,7 @@
   1. 全量扫描 3 个 Parquet 分块（跳过 iq 列，120 万行标签/参数全量统计）
   2. 生成 6 张统计图 -> figures/real_analysis/
   3. 抽样各类别样本生成 2x2 IQ 组合图 -> figures/real_samples/
-  4. 输出 JSON 统计结果 -> files/real_data_stats.json（供报告引用）
+  4. 输出 JSON 统计结果 -> docs/real_data_stats.json（供报告引用）
 
 用法:
     python utils/analyze_real.py                 # 全量分析 + 画图

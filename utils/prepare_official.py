@@ -15,7 +15,7 @@
      并写 datasets_official/{split}_{task}.parquet 兼容 build_task_dataloaders
   4. val 划分: 对 protocol/modulation 按 label 分层抽样；parameter 按 pattern 分层
 
-统计来源: files/real_data_stats.json（全量 1,179,000 行扫描结果）
+统计来源: docs/real_data_stats.json（全量 1,179,000 行扫描结果）
 """
 
 import os
