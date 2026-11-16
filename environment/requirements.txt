@@ -1,5 +1,5 @@
 # 环境锁定（本框架验证版本）
-# 安装: pip install -r requirements_lock.txt
+# 安装: pip install -r requirements.txt
 torch==2.2.0
 pandas==2.0.3
 numpy==1.24.3
@@ -8,3 +8,4 @@ safetensors==0.5.3
 tqdm==4.66.4
 tensorboard==2.16.2
 matplotlib==3.8.4
+pytest==8.0.0

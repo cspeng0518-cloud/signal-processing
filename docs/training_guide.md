@@ -19,7 +19,7 @@ all pure-torch native implementations with no dependency on `mamba-ssm`,
 make sure they are installed on the training machine. Pinned versions recommended:
 
 ```bash
-pip install -r requirements_lock.txt
+pip install -r environment/requirements.txt
 ```
 
 ---

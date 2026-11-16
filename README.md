@@ -5,11 +5,10 @@
 ## 最快入口
 
 ```bash
-pip install -r environment/requirements_lock.txt
+pip install -r environment/requirements.txt
 python -m pytest tests/test_model_pipeline.py tests/test_infer_outputs.py -q
 python code/training/pretrain_mae.py --data_dir datasets --out_dir weights
 python code/training/finetune_multitask.py --data_dir datasets --out_dir weights
-python utils/plot_training.py --input logs/finetune_metrics.jsonl
 python code/infer.py --input datasets/test_modulation.parquet --output out/test_predictions.jsonl
 ```
 
@@ -21,9 +20,9 @@ python code/infer.py --input datasets/test_modulation.parquet --output out/test_
 
 ## 文档
 
-- [详细审查、改动与验证状态](docs/CHANGELOG_AND_REVIEW.md)
-- [本地自测报告](docs/self_test_report.md)
-- [官方任务书](files/)
+- [审查、改动与验证状态](docs/CHANGELOG_AND_REVIEW.md)
+- [训练指导](docs/training_guide.md)
+- [官方任务书与分析](docs/C01_task_analysis.md)
 
 ## 关键限制
 
