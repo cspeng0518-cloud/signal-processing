@@ -1,210 +1,142 @@
-"""多任务联合微调（对应赛题任务2：单一基座 + 三个任务头）
-
-用法:
-    python code/training/finetune_multitask.py --config code/configs/default.json
-
-流程:
-  1. 加载（可选）MAE 预训练的 tokenizer+backbone 权重
-  2. 每个 epoch 在三任务间轮转：共享 backbone 接收三任务梯度
-  3. 保存完整模型 -> weights/model.safetensors + weights/config.json
-     同时保存参数归一化统计 -> weights/param_stats.json（推理反归一化用）
-"""
-
+"""阶段二：单基座三任务联合微调，校验后保存最佳 checkpoint。"""
 import os
 import sys
 import json
 import argparse
-import logging
-
+from pathlib import Path
+import numpy as np
 import torch
-import torch.nn as nn
+import torch.nn.functional as F
+from safetensors.torch import save_file
 
-ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-CODE_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-sys.path.insert(0, CODE_ROOT)  # models/utils 包根（code/）
-
+ROOT=Path(__file__).resolve().parents[2]
+sys.path.insert(0,str(ROOT/"code"))
 from models import EMFoundation
-from utils.dataset import (
-    build_task_dataloaders, save_param_stats, LABEL2ID, ID2LABEL,
-)
+from utils.dataset import build_task_dataloaders, save_param_stats
 from utils.metrics import accuracy, macro_recall, precision_score
-
-TASKS = ("protocol", "modulation", "parameter")
-PATTERN_LOSS_W = 0.5  # parameter_pattern 辅助头权重
-
-
-def setup_logger(log_dir):
-    os.makedirs(log_dir, exist_ok=True)
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        handlers=[logging.StreamHandler(), logging.FileHandler(
-            os.path.join(log_dir, "train.log"), encoding="utf-8")],
-    )
-    return logging.getLogger("finetune")
+from utils.logger import get_logger,record_metrics
+from utils.train_utils import seed_all,get_device,autocast_context,build_scheduler,optimizer_step
+TASKS=("protocol","modulation","parameter")
 
 
-def evaluate(model, loader, task, device, param_stats, ref_scale):
-    """验证集评估：返回各任务指标"""
-    import numpy as np
-    model.eval()
-    ys, ps, vs = [], [], []
-    with torch.no_grad():
-        for batch in loader:
-            iq, sr = batch["iq"].to(device), batch["sr"].to(device)
-            out = model(iq, sr, task)
-            if task == "parameter":
-                # pattern 头硬掩码：预测模式决定不适用参数置 0（归一化空间）
-                pattern_logits = model(iq, sr, "parameter_pattern")
-                pat = pattern_logits.argmax(-1)  # [B] 0=通信 1=雷达
-                mask = torch.zeros_like(out)
-                mask[:, :3][pat == 0] = 1.0   # 通信: 前 3 参数有效
-                mask[:, 3:][pat == 1] = 1.0   # 雷达: 后 4 参数有效
-                out = out * mask
-                pred = out.cpu().numpy()
-                # 反归一化到原始量纲（无效维保持 0.0）
-                mn, mx = param_stats["min"], param_stats["max"]
-                pred = pred * (mx - mn) + mn
-                ps.append(pred)
-                vs.append(batch["valid"].numpy())
-                ys.append(batch["params"].numpy() * (mx - mn) + mn)
+def parameter_loss(pred,target,valid):
+    """逐元素 masked smooth L1，归一化于有效目标数。"""
+    return (F.smooth_l1_loss(pred,target,reduction="none")*valid).sum()/valid.sum().clamp_min(1.0)
+
+
+def evaluate(model,loader,task,device,stats,reference):
+    model.eval(); gt=[];pred=[];valid=[]
+    with torch.inference_mode():
+        for b in loader:
+            iq=b["iq"].to(device);sr=b["sr"].to(device)
+            feat=model.encode(iq,sr)
+            out=model.task_heads[task](feat)
+            if task=="parameter":
+                raw=out.float().cpu().numpy()
+                raw=raw*(stats["max"]-stats["min"])+stats["min"]
+                truth=b["params"].numpy()*(stats["max"]-stats["min"])+stats["min"]
+                gt.append(truth);pred.append(raw);valid.append(b["valid"].numpy())
             else:
-                ps.append(out.argmax(-1).cpu().numpy())
-                ys.append(batch["label"].numpy())
-    y = np.concatenate(ys)
-    p = np.concatenate(ps)
-    if task == "parameter":
-        v = np.concatenate(vs)
-        prec = precision_score(y, p, ref_scale, valid=v)
-        return {"precision": prec, "rmse": None}
-    n_cls = 8 if task == "protocol" else 23
-    return {"acc": accuracy(y, p), "macro_recall": macro_recall(y, p, n_cls)}
+                gt.append(b["label"].numpy());pred.append(out.argmax(-1).cpu().numpy())
+    y=np.concatenate(gt); p=np.concatenate(pred)
+    if task=="parameter":
+        v=np.concatenate(valid)
+        # 仅 valid=true 的维度评估；无效分量不参与本地指标
+        return {"precision":float(precision_score(y,p,reference,valid=v)),
+                "rmse":float(np.sqrt(np.sum((y-p)**2*v)/max(1,v.sum())))}
+    n_cls=8 if task=="protocol" else 23
+    return {"acc":float(accuracy(y,p)),"macro_recall":float(macro_recall(y,p,n_cls))}
+
+
+def export_model(model,cfg,stats,out):
+    out=Path(out);out.mkdir(parents=True,exist_ok=True)
+    tensors={f"model.{k}":v.detach().cpu().contiguous() for k,v in model.state_dict().items()}
+    save_file(tensors,str(out/"model.safetensors"))
+    (out/"config.json").write_text(json.dumps(cfg,indent=2,ensure_ascii=False),encoding="utf-8")
+    save_param_stats(stats,out/"param_stats.json")
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--config", default=os.path.join(ROOT, "code", "configs", "default.json"))
-    parser.add_argument("--data_dir", default=os.path.join(ROOT, "datasets_official"),
-                        help="官方预处理目录（datasets_official/）或模拟数据目录（datasets/）")
-    parser.add_argument("--out_dir", default=os.path.join(ROOT, "weights"))
-    parser.add_argument("--from_mae", default=None,
-                        help="MAE 预训练权重路径（缺省则用 out_dir/mae_pretrained.pt，不存在则从零开始）")
-    parser.add_argument("--smoke_steps", type=int, default=None,
-                        help="冒烟测试：每 epoch 限制优化步数（跳过验证集评估）")
-    args = parser.parse_args()
-
-    with open(args.config, "r", encoding="utf-8") as f:
-        cfg = json.load(f)
-
-    logger = setup_logger(os.path.join(ROOT, "logs"))
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    logger.info(f"device: {device}, backbone: {cfg['backbone']}")
-
-    # ---- 数据 ----
-    loaders, param_stats = build_task_dataloaders(
-        args.data_dir, batch_size=cfg["batch_size"], seq_len=cfg["seq_len"])
-    logger.info("dataloaders ready: "
-                + ", ".join(f"{t}(train={len(loaders['train'][t].dataset)})" for t in TASKS))
-
-    # ---- 模型（可选加载 MAE 预训练权重）----
-    model = EMFoundation(cfg).to(device)
-    mae_path = args.from_mae or os.path.join(args.out_dir, "mae_pretrained.pt")
-    if os.path.exists(mae_path):
-        state = torch.load(mae_path, map_location=device)
-        model.tokenizer.load_state_dict(state["tokenizer"])
-        model.backbone.load_state_dict(state["backbone"])
-        logger.info(f"loaded MAE pretrained weights from {mae_path}")
-    else:
-        logger.info("no MAE checkpoint found, training from scratch")
-
-    logger.info(f"shared_ratio = {model.shared_ratio():.2%} (官方红线 >80%)")
-
-    optim = torch.optim.AdamW(model.parameters(), lr=cfg["lr"],
-                              weight_decay=cfg["weight_decay"])
-    ce = nn.CrossEntropyLoss()
-    mse = nn.MSELoss()
-    ref_scale = cfg.get("ref_scale", 0.5)
-    epochs = cfg["epochs_finetune"]
-
-    best_score = -1.0
-    for ep in range(epochs):
-        model.train()
-        losses = {t: 0.0 for t in TASKS}
-        # ---- 三任务轮转训练（同一 optimizer，共享 backbone）----
-        iters = {t: iter(loaders["train"][t]) for t in TASKS}
-        n_steps = max(len(loaders["train"][t]) for t in TASKS)
-        if args.smoke_steps:
-            n_steps = min(n_steps, args.smoke_steps)
+    p=argparse.ArgumentParser()
+    p.add_argument("--config",default=str(ROOT/"code/configs/default.json"))
+    p.add_argument("--data_dir",default=str(ROOT/"datasets"))
+    p.add_argument("--out_dir",default=str(ROOT/"weights"))
+    p.add_argument("--from_mae",default=None)
+    p.add_argument("--resume",default=None)
+    p.add_argument("--smoke_steps",type=int,default=0)
+    args=p.parse_args()
+    cfg=json.loads(Path(args.config).read_text(encoding="utf-8"));seed_all(cfg.get("seed",42))
+    device=get_device(); logger=get_logger("finetune",ROOT/"logs")
+    loaders,stats=build_task_dataloaders(args.data_dir,batch_size=cfg["batch_size"],seq_len=cfg["seq_len"])
+    missing=[t for t in TASKS if t not in loaders["train"]]
+    if missing:raise RuntimeError(f"Missing required train tasks: {missing}")
+    model=EMFoundation(cfg).to(device)
+    if model.shared_ratio()<=.8:raise RuntimeError("Shared parameter ratio must exceed 80%")
+    if sum(p.numel() for p in model.parameters())>=1_000_000_000:raise RuntimeError("Model exceeds 1B parameters")
+    mae=args.from_mae or str(Path(args.out_dir)/"mae_pretrained.pt")
+    if Path(mae).exists() and not args.resume:
+        sd=torch.load(mae,map_location="cpu",weights_only=False)
+        for key in ("tokenizer","backbone","frequency_tokenizer","cross_domain_fusion"):
+            if key in sd and hasattr(model,key):getattr(model,key).load_state_dict(sd[key])
+        logger.info("loaded pretrained backbone from %s",mae)
+    optimizer=torch.optim.AdamW(model.parameters(),lr=cfg["lr"],weight_decay=cfg["weight_decay"])
+    n_steps=max(len(loaders["train"][t]) for t in TASKS)
+    if args.smoke_steps:n_steps=min(n_steps,args.smoke_steps)
+    scheduler=build_scheduler(optimizer,n_steps*len(TASKS)*cfg["epochs_finetune"],cfg.get("warmup_ratio",.1))
+    scaler=torch.amp.GradScaler("cuda",enabled=(device.type=="cuda" and cfg.get("amp",True)))
+    start=0;best=-float("inf");bad=0
+    if args.resume:
+        state=torch.load(args.resume,map_location="cpu",weights_only=False)
+        model.load_state_dict(state["model"]);optimizer.load_state_dict(state["optimizer"])
+        scheduler.load_state_dict(state["scheduler"]);scaler.load_state_dict(state["scaler"])
+        start=state["epoch"]+1;best=state["best"];bad=state.get("bad",0)
+    Path(args.out_dir).mkdir(parents=True,exist_ok=True)
+    logger.info("device=%s shared=%.2f%% model_params=%d",device,model.shared_ratio()*100,sum(p.numel() for p in model.parameters()))
+    weights=cfg.get("task_weights",{"protocol":.3,"modulation":.3,"parameter":.4})
+    for epoch in range(start,cfg["epochs_finetune"]):
+        model.train();accum={t:0 for t in TASKS};iters={t:iter(loaders["train"][t]) for t in TASKS}
         for step in range(n_steps):
-            for t in TASKS:
-                try:
-                    batch = next(iters[t])
+            for task in TASKS:
+                try:b=next(iters[task])
                 except StopIteration:
-                    iters[t] = iter(loaders["train"][t])
-                    batch = next(iters[t])
-                iq, sr = batch["iq"].to(device), batch["sr"].to(device)
-                out = model(iq, sr, t)
-                if t == "parameter":
-                    # 回归损失：仅对有效参数计算（valid 掩码参与）
-                    target = batch["params"].to(device)
-                    valid = batch["valid"].to(device)          # [B,7]
-                    reg_loss = (mse(out, target) * valid).sum() / (valid.sum() + 1e-8)
-                    # pattern 辅助损失：通信/雷达模式二分类
-                    pat_logits = model(iq, sr, "parameter_pattern")
-                    pat_loss = ce(pat_logits, batch["pattern"].to(device))
-                    loss = reg_loss + PATTERN_LOSS_W * pat_loss
-                else:
-                    loss = ce(out, batch["label"].to(device))
-                optim.zero_grad()
-                loss.backward()
-                optim.step()
-                losses[t] += loss.item()
+                    iters[task]=iter(loaders["train"][task]);b=next(iters[task])
+                iq=b["iq"].to(device);sr=b["sr"].to(device)
+                with autocast_context(device,cfg.get("amp",True)):
+                    feat=model.encode(iq,sr)
+                    out=model.task_heads[task](feat)
+                    if task=="parameter":
+                        target=b["params"].to(device); valid=b["valid"].to(device)
+                        loss=parameter_loss(out,target,valid)
+                        pattern=model.task_heads["parameter_pattern"](feat)
+                        loss=loss+cfg.get("pattern_loss_weight",.3)*F.cross_entropy(pattern,b["pattern"].to(device))
+                    else:loss=F.cross_entropy(out,b["label"].to(device))
+                    loss=loss*float(weights[task])
+                optimizer_step(loss,optimizer,model,scaler,cfg.get("grad_clip",1.0))
+                scheduler.step();accum[task]+=loss.item()
+        values={f"train_{t}_weighted_loss":accum[t]/max(1,n_steps) for t in TASKS}
+        values["lr"]=scheduler.get_last_lr()[0]
+        if not args.smoke_steps and (epoch+1)%cfg.get("eval_every",1)==0:
+            if any(t not in loaders.get("val",{}) for t in TASKS):
+                raise RuntimeError("Missing validation split for one or more tasks")
+            results={t:evaluate(model,loaders["val"][t],t,device,stats,cfg.get("ref_scale",.5)) for t in TASKS}
+            for t,metrics in results.items():
+                for key,val in metrics.items():values[f"val_{t}_{key}"]=val
+            # 与初赛 30/30/40 权重一致；参数精度仅为非官方参考尺度的本地近似
+            score=.3*results["protocol"]["acc"]+.3*results["modulation"]["acc"]+.4*results["parameter"]["precision"]
+            values["val_proxy_score"]=score
+            if score>best:
+                best=score;bad=0;export_model(model,cfg,stats,args.out_dir)
+                logger.info("new best proxy score=%.5f",best)
+            else:bad+=1
+        record_metrics(ROOT/"logs","finetune",epoch+1,values)
+        logger.info("epoch=%d %s",epoch+1," ".join(f"{k}={v:.5f}" for k,v in values.items()))
+        torch.save({"epoch":epoch,"model":model.state_dict(),"optimizer":optimizer.state_dict(),
+                    "scheduler":scheduler.state_dict(),"scaler":scaler.state_dict(),"best":best,"bad":bad},
+                   Path(args.out_dir)/"finetune_resume.pt")
+        if args.smoke_steps:break
+        if bad>=cfg.get("patience",7):
+            logger.info("early stopping at epoch %d",epoch+1);break
+    if args.smoke_steps:export_model(model,cfg,stats,args.out_dir)
+    logger.info("finished. official inference weights: %s",Path(args.out_dir)/"model.safetensors")
 
-        msg = " | ".join(f"{t}: {losses[t]/max(n_steps,1):.4f}" for t in TASKS)
-        logger.info(f"epoch {ep+1}/{epochs}  loss[{msg}]")
-
-        # ---- 验证 ----
-        if args.smoke_steps:
-            logger.info("smoke mode: skip evaluation")
-            break
-        if (ep + 1) % 5 == 0 or ep == epochs - 1:
-            evals = {t: evaluate(model, loaders["val"][t], t, device, param_stats, ref_scale)
-                     for t in TASKS}
-            logger.info(
-                f"  val protocol: acc={evals['protocol']['acc']:.3f} "
-                f"recall={evals['protocol']['macro_recall']:.3f} | "
-                f"modulation: acc={evals['modulation']['acc']:.3f} "
-                f"recall={evals['modulation']['macro_recall']:.3f} | "
-                f"parameter: precision={evals['parameter']['precision']:.3f}"
-            )
-            cur = (evals["protocol"]["acc"] + evals["modulation"]["acc"]
-                   + evals["parameter"]["precision"]) / 3
-            if cur > best_score:
-                best_score = cur
-                save_model(model, cfg, param_stats, args.out_dir)
-                logger.info(f"  saved best (mean={best_score:.4f})")
-
-    save_model(model, cfg, param_stats, args.out_dir, suffix="final")
-    logger.info("finetune done.")
-
-
-def save_model(model, cfg, param_stats, out_dir, suffix="best"):
-    """保存官方交付格式：
-      weights/model.safetensors   —— 完整模型权重
-      weights/config.json         —— 模型结构配置
-      weights/param_stats.json    —— 参数归一化统计
-    """
-    from safetensors.torch import save_file
-    os.makedirs(out_dir, exist_ok=True)
-    sd = {f"model.{k}": v for k, v in model.state_dict().items()}
-    save_file(sd, os.path.join(out_dir, "model.safetensors"))
-    with open(os.path.join(out_dir, "config.json"), "w", encoding="utf-8") as f:
-        json.dump(cfg, f, indent=2)
-    save_param_stats(param_stats, os.path.join(out_dir, "param_stats.json"))
-    if suffix != "best":
-        # final 版本另存一份数据（best 已保存）
-        save_file(sd, os.path.join(out_dir, f"model_{suffix}.safetensors"))
-
-
-if __name__ == "__main__":
-    main()
+if __name__=="__main__":main()

@@ -1,124 +1,85 @@
-"""MAE 掩码重建预训练（对应赛题任务1的时域表征学习 + EMind 预训练阶段）
-
-用法:
-    python code/training/pretrain_mae.py --config code/configs/default.json [--skip]
-
-流程:
-  1. 读取三任务全部训练数据（MAE 不需要标签，所有 IQ 混用）
-  2. 随机掩码 75% patch，backbone 只编码可见 token，轻量 decoder 重建
-  3. 保存 backbone + tokenizer 权重（供微调初始化）
-"""
-
+"""阶段一：时频双流 MAE 自监督预训练。"""
 import os
 import sys
 import json
 import argparse
-import logging
+from pathlib import Path
 
 import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, ConcatDataset, Dataset
 
-ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-CODE_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-sys.path.insert(0, CODE_ROOT)  # models/utils 包根（code/）
-
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "code"))
 from models import EMFoundation
-from utils.dataset import EMSignalDataset, collate_fn, PARAM_NAMES, FS
+from utils.dataset import make_task_dataset
+from utils.logger import get_logger, record_metrics
+from utils.train_utils import seed_all, get_device, autocast_context, build_scheduler, optimizer_step
 
 
-def setup_logger(log_dir):
-    os.makedirs(log_dir, exist_ok=True)
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        handlers=[logging.StreamHandler(), logging.FileHandler(
-            os.path.join(log_dir, "train.log"), encoding="utf-8")],
-    )
-    return logging.getLogger("pretrain")
-
-
-class MixedMAEDataset(EMSignalDataset):
-    """MAE 用：忽略标签，只取 IQ"""
-
+class UnlabeledIQ(Dataset):
+    def __init__(self, dataset): self.dataset = dataset
+    def __len__(self): return len(self.dataset)
     def __getitem__(self, i):
-        row = self.df.iloc[i]
-        from utils.dataset import to_iq_array
-        iq = to_iq_array(row["iq"], self.seq_len)
-        return {"iq": torch.from_numpy(iq),
-                "sr": torch.tensor(FS, dtype=torch.float32)}
-
-
-def mae_collate(batch):
-    return {"iq": torch.stack([b["iq"] for b in batch]),
-            "sr": torch.stack([b["sr"] for b in batch])}
+        item = self.dataset[i]
+        return item["iq"], item["sr"]
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--config", default=os.path.join(ROOT, "code", "configs", "default.json"))
-    parser.add_argument("--data_dir", default=os.path.join(ROOT, "datasets"))
-    parser.add_argument("--out_dir", default=os.path.join(ROOT, "weights"))
-    args = parser.parse_args()
+    p=argparse.ArgumentParser()
+    p.add_argument("--config",default=str(ROOT/"code/configs/default.json"))
+    p.add_argument("--data_dir",default=str(ROOT/"datasets"))
+    p.add_argument("--out_dir",default=str(ROOT/"weights"))
+    p.add_argument("--resume",default=None)
+    p.add_argument("--smoke_steps",type=int,default=0)
+    args=p.parse_args()
+    cfg=json.loads(Path(args.config).read_text(encoding="utf-8"))
+    seed_all(cfg.get("seed",42)); device=get_device()
+    logger=get_logger("pretrain",ROOT/"logs")
+    datasets=[]
+    for task in ("protocol","modulation","parameter"):
+        try:
+            datasets.append(UnlabeledIQ(make_task_dataset(args.data_dir,task,"train",cfg["seq_len"])))
+        except FileNotFoundError:
+            logger.warning("Missing training data for %s",task)
+    if not datasets: raise FileNotFoundError("No training data")
+    loader=DataLoader(ConcatDataset(datasets),batch_size=cfg["batch_size"],shuffle=True,
+                      num_workers=cfg.get("num_workers",0),pin_memory=(device.type=="cuda"))
+    model=EMFoundation(cfg).to(device)
+    optim=torch.optim.AdamW(list(model.tokenizer.parameters()) + list(model.backbone.parameters()) +
+                             list(model.mae_decoder.parameters()) + list(model.mask_token for _ in [0]) +
+                             (list(model.frequency_tokenizer.parameters())+list(model.cross_domain_fusion.parameters()) if model.use_frequency else []),
+                             lr=cfg["lr"],weight_decay=cfg["weight_decay"])
+    steps=min(len(loader),args.smoke_steps) if args.smoke_steps else len(loader)
+    scheduler=build_scheduler(optim,max(1,steps*cfg["epochs_pretrain"]),cfg.get("warmup_ratio",0.1))
+    scaler=torch.amp.GradScaler("cuda",enabled=(device.type=="cuda" and cfg.get("amp",True)))
+    start=0
+    if args.resume:
+        state=torch.load(args.resume,map_location="cpu",weights_only=False)
+        model.load_state_dict(state["model"]);optim.load_state_dict(state["optimizer"])
+        scheduler.load_state_dict(state["scheduler"]);scaler.load_state_dict(state["scaler"])
+        start=state["epoch"]+1
+    Path(args.out_dir).mkdir(parents=True,exist_ok=True)
+    logger.info("device=%s samples=%s shared_ratio=%.3f",device,len(loader.dataset),model.shared_ratio())
+    for epoch in range(start,cfg["epochs_pretrain"]):
+        model.train();total=0; count=0
+        for i,(iq,sr) in enumerate(loader):
+            if args.smoke_steps and i>=args.smoke_steps: break
+            iq=iq.to(device);sr=sr.to(device)
+            with autocast_context(device,cfg.get("amp",True)):
+                recon,target=model.forward_mae(iq,sr)
+                loss=(recon.float()-target.float()).square().mean()
+            optimizer_step(loss,optim,model,scaler,cfg.get("grad_clip",1.0))
+            scheduler.step();total+=loss.item()*len(iq);count+=len(iq)
+        avg=total/max(1,count)
+        record_metrics(ROOT/"logs","pretrain",epoch+1,{"recon_mse":avg,"lr":scheduler.get_last_lr()[0]})
+        logger.info("epoch=%d masked_MSE=%.6f",epoch+1,avg)
+        torch.save({"epoch":epoch,"model":model.state_dict(),"optimizer":optim.state_dict(),
+                    "scheduler":scheduler.state_dict(),"scaler":scaler.state_dict()},
+                   Path(args.out_dir)/"mae_resume.pt")
+    torch.save({"tokenizer":model.tokenizer.state_dict(),"backbone":model.backbone.state_dict(),
+                **({"frequency_tokenizer":model.frequency_tokenizer.state_dict(),
+                    "cross_domain_fusion":model.cross_domain_fusion.state_dict()} if model.use_frequency else {})},
+               Path(args.out_dir)/"mae_pretrained.pt")
+    logger.info("saved MAE pretrained backbone")
 
-    with open(args.config, "r", encoding="utf-8") as f:
-        cfg = json.load(f)
-
-    logger = setup_logger(os.path.join(ROOT, "logs"))
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    logger.info(f"device: {device}, backbone: {cfg['backbone']}")
-
-    # ---- 数据：三任务训练 IQ 混用（官方数据或模拟数据布局均可）----
-    ds_list = []
-    for task in ("protocol", "modulation", "parameter"):
-        p = os.path.join(args.data_dir, f"train_{task}.parquet")
-        if not os.path.exists(p):
-            logger.warning(f"missing {p}, skip")
-            continue
-        ds_list.append(MixedMAEDataset(p, task, seq_len=cfg["seq_len"]))
-    if not ds_list:
-        raise FileNotFoundError(f"no train_*.parquet under {args.data_dir}")
-    dataset = torch.utils.data.ConcatDataset(ds_list)
-    loader = DataLoader(dataset, batch_size=cfg["batch_size"], shuffle=True,
-                        collate_fn=mae_collate, num_workers=cfg["num_workers"])
-    logger.info(f"MAE pretraining on {len(dataset)} unlabeled IQ samples")
-
-    # ---- 模型 ----
-    model = EMFoundation(cfg).to(device)
-    logger.info(f"params: shared={model.shared_parameter_count()/1e6:.2f}M "
-                f"heads={model.head_parameter_count()/1e3:.1f}K "
-                f"shared_ratio={model.shared_ratio():.1%}")
-
-    optim = torch.optim.AdamW(model.parameters(), lr=cfg["lr"],
-                              weight_decay=cfg["weight_decay"])
-    criterion = nn.MSELoss()
-    epochs = cfg["epochs_pretrain"]
-
-    model.train()
-    for ep in range(epochs):
-        total, n = 0.0, 0
-        for batch in loader:
-            iq = batch["iq"].to(device)  # [B,N,2]
-            sr = batch["sr"].to(device)
-            recon, target = model.forward_mae(iq, sr)
-            loss = criterion(recon, target)
-            optim.zero_grad()
-            loss.backward()
-            optim.step()
-            total += loss.item() * iq.size(0)
-            n += iq.size(0)
-        logger.info(f"epoch {ep+1}/{epochs}  recon_mse={total/n:.6f}")
-
-    # ---- 保存 ----
-    os.makedirs(args.out_dir, exist_ok=True)
-    state = {
-        "tokenizer": model.tokenizer.state_dict(),
-        "backbone": model.backbone.state_dict(),
-        "mae_decoder": model.mae_decoder.state_dict(),
-    }
-    torch.save(state, os.path.join(args.out_dir, "mae_pretrained.pt"))
-    logger.info(f"saved MAE weights -> {args.out_dir}/mae_pretrained.pt")
-
-
-if __name__ == "__main__":
-    main()
+if __name__=="__main__":main()
