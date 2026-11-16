@@ -46,8 +46,12 @@ class MAEDecoder(nn.Module):
             layer = nn.TransformerEncoderLayer(
                 d_model=d_model, nhead=nhead, dim_feedforward=4 * d_model,
                 dropout=0.1, batch_first=True, activation="gelu",
+                norm_first=True,  # pre-norm：与主干一致，深栈训练更稳
             )
-            self.decoder = nn.TransformerEncoder(layer, num_layers=n_layers)
+            self.decoder = nn.TransformerEncoder(
+                layer, num_layers=n_layers,
+                norm=nn.LayerNorm(d_model),  # pre-norm 必须补 final norm
+            )
         self.proj = nn.Linear(d_model, 2 * patch_size)  # 回到 IQ patch 维
 
     def forward(self, x):

@@ -6,7 +6,7 @@
 
 层级类层次（与 backbone.py 的编码器级层次同构，调用方零分支）:
   BaseSequenceLayer     抽象基类：统一 forward 契约
-  ├── AttentionLayer    注意力层（full / MLA 核心可插拔）+ FFN，post-norm
+  ├── AttentionLayer    注意力层（full / MLA 核心可插拔）+ FFN，pre-norm
   ├── GatedDeltaLayer   Gated DeltaNet 层 + FFN（对齐 Qwen3NextDecoderLayer
   │                     的 linear_attn + MLP 结构）
   └── MambaLayer        Mamba 层（block 内部自带扩展投影，与 MambaEncoder
@@ -57,7 +57,7 @@ class BaseSequenceLayer(nn.Module, ABC):
 
 class AttentionLayer(BaseSequenceLayer):
     """注意力层：token 混合（full / MLA 核心可插拔）+ 通道混合（FFN），
-    post-norm 结构对齐 RoPEEncoderLayer。"""
+    pre-norm 结构对齐 RoPEEncoderLayer / Llama。"""
 
     def __init__(self, attn, d_model, dim_feedforward, dropout=0.1):
         super().__init__()
@@ -67,13 +67,13 @@ class AttentionLayer(BaseSequenceLayer):
         self.norm2 = nn.LayerNorm(d_model)
 
     def forward(self, x, rope, pos_ids=None, key_padding_mask=None):
-        x = self.norm1(x + self.attn(x, rope, pos_ids, key_padding_mask))
-        return self.norm2(x + self.ff(x))
+        x = x + self.attn(self.norm1(x), rope, pos_ids, key_padding_mask)
+        return x + self.ff(self.norm2(x))
 
 
 class GatedDeltaLayer(BaseSequenceLayer):
     """Gated DeltaNet 层 + FFN（GDA 内部已含投影/卷积/门控，
-    外层补通道混合，结构对齐 Qwen3NextDecoderLayer）。"""
+    外层补通道混合，pre-norm 对齐 Qwen3NextDecoderLayer）。"""
 
     def __init__(self, d_model, nhead, dim_feedforward, dropout=0.1, conv_kernel=4):
         super().__init__()
@@ -84,8 +84,8 @@ class GatedDeltaLayer(BaseSequenceLayer):
 
     def forward(self, x, rope, pos_ids=None, key_padding_mask=None):
         # GDA 位置无关：rope / pos_ids / key_padding_mask 均忽略
-        x = self.norm1(x + self.gda(x))
-        return self.norm2(x + self.ff(x))
+        x = x + self.gda(self.norm1(x))
+        return x + self.ff(self.norm2(x))
 
 
 class MambaLayer(BaseSequenceLayer):

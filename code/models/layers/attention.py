@@ -6,7 +6,7 @@
   RoPEAttention    标准多头自注意力（q/k 按相对位置旋转）
   MLAAttention     DeepSeek-V2 式多头潜在注意力（KV 低秩压缩 + 解耦 RoPE）
 
-RoPEEncoderLayer  注意力 + FFN 的 post-norm 层（RoPETransformerEncoder 与
+RoPEEncoderLayer  注意力 + FFN 的 pre-norm 层（RoPETransformerEncoder 与
                   HybridEncoder 共用的层结构，见 backbone.py / hybrid.py）
 
 实现参考: HuggingFace transformers
@@ -157,7 +157,11 @@ class SwiGLU(nn.Module):
 
 
 class RoPEEncoderLayer(nn.Module):
-    """post-norm Transformer encoder layer（结构对齐 nn.TransformerEncoderLayer 默认）。"""
+    """pre-norm Transformer encoder layer（Llama/GLM 风格）。
+
+    残差主干为恒等通路，LayerNorm 移到子层输入侧——深栈梯度直通底层，
+    训练稳定性显著优于 post-norm；栈末的 final norm 由 BaseEncoder.norm 提供。
+    """
 
     def __init__(self, d_model, nhead, dim_feedforward, dropout=0.1):
         super().__init__()
@@ -167,5 +171,5 @@ class RoPEEncoderLayer(nn.Module):
         self.norm2 = nn.LayerNorm(d_model)
 
     def forward(self, x, rope, pos_ids=None, key_padding_mask=None):
-        x = self.norm1(x + self.attn(x, rope, pos_ids, key_padding_mask))
-        return self.norm2(x + self.ff(x))
+        x = x + self.attn(self.norm1(x), rope, pos_ids, key_padding_mask)
+        return x + self.ff(self.norm2(x))

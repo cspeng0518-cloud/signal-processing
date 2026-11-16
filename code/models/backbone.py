@@ -84,6 +84,7 @@ class SinTransformerEncoder(BaseEncoder):
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model, nhead=nhead, dim_feedforward=dim_feedforward,
             dropout=dropout, batch_first=True, activation="gelu",
+            norm_first=True,  # pre-norm：深栈梯度稳定（final norm 由基类 self.norm 提供）
         )
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
 
