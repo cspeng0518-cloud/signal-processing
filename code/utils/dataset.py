@@ -115,7 +115,9 @@ class EMSignalDataset(Dataset):
 
     def __init__(self, parquet_path, task, seq_len=1024, param_stats=None):
         self.df = pd.read_parquet(parquet_path)
-        self.task = task
+        self.task = "protocol" if task == "system" else task
+        if "task" in self.df.columns:
+            self.df = self.df[self.df["task"].replace({"system":"protocol"}) == self.task].reset_index(drop=True)
         self.seq_len = seq_len
         self.param_stats = param_stats
         self.style = _detect_style(self.df)
@@ -264,9 +266,15 @@ def compute_param_stats(parquet_path):
         return {"min": DEFAULT_PARAM_STATS["min"].copy(),
                 "max": DEFAULT_PARAM_STATS["max"].copy()}
     df = pd.read_parquet(parquet_path)
-    arr = np.array([[row[f"param_{n}"] for n in PARAM_NAMES] for _, row in df.iterrows()],
-                   dtype=np.float32)
-    return {"min": arr.min(axis=0), "max": arr.max(axis=0)}
+    mins, maxs = [], []
+    for n in PARAM_NAMES:
+        col = n if n in df.columns else f"param_{n}"
+        flag = n+"_valid" if n+"_valid" in df.columns else f"valid_{n}"
+        v = df.loc[df[flag].astype(bool), col].to_numpy(dtype=np.float64)
+        if not len(v):
+            raise ValueError(f"No valid observations for {n}")
+        mins.append(float(v.min())); maxs.append(float(v.max()))
+    return {"min": np.array(mins, dtype=np.float32), "max": np.array(maxs, dtype=np.float32)}
 
 
 def build_task_dataloaders(data_dir, batch_size=32, seq_len=1024, splits=("train", "val"),
@@ -282,8 +290,12 @@ def build_task_dataloaders(data_dir, batch_size=32, seq_len=1024, splits=("train
           "val": {...},
         }, param_stats
     """
-    param_stats = {"min": DEFAULT_PARAM_STATS["min"].copy(),
-                   "max": DEFAULT_PARAM_STATS["max"].copy()}
+    stats_file = os.path.join(data_dir, "param_stats.json")
+    if os.path.exists(stats_file):
+        param_stats = load_param_stats(stats_file)
+    else:
+        param_stats = {"min": DEFAULT_PARAM_STATS["min"].copy(),
+                       "max": DEFAULT_PARAM_STATS["max"].copy()}
     loaders = {}
     for split in splits:
         loaders[split] = {}

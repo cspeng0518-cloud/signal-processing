@@ -17,6 +17,7 @@ import torch
 import torch.nn as nn
 
 from .tokenizer import IQTokenizer
+from .frequency import FrequencyTokenizer, CrossDomainFusion
 from .backbone import build_backbone
 from .heads import ClassificationHead, RegressionHead
 
@@ -64,6 +65,12 @@ class EMFoundation(nn.Module):
             d_model, patch_size, config.get("mae_decoder_layers", 2)
         )
         self.mask_ratio = mask_ratio
+        self.use_frequency = bool(config.get("use_frequency", True))
+        if self.use_frequency:
+            self.frequency_tokenizer = FrequencyTokenizer(d_model, patch_size)
+            self.cross_domain_fusion = CrossDomainFusion(d_model, config.get("nhead", 4))
+        self.mask_token = nn.Parameter(torch.zeros(1, 1, d_model))
+        nn.init.trunc_normal_(self.mask_token, std=0.02)
         self.patch_size = patch_size
         # ---- 任务私有 head（task_heads 唯一持有，避免 safetensors 共享内存冲突）----
         self.task_heads = nn.ModuleDict({
@@ -91,8 +98,11 @@ class EMFoundation(nn.Module):
 
     def shared_parameter_count(self):
         """共享（任务间共用）参数量"""
-        return sum(p.numel() for p in self.tokenizer.parameters()) + \
-               sum(p.numel() for p in self.backbone.parameters())
+        total = sum(p.numel() for p in self.tokenizer.parameters()) + sum(p.numel() for p in self.backbone.parameters())
+        if self.use_frequency:
+            total += sum(p.numel() for p in self.frequency_tokenizer.parameters())
+            total += sum(p.numel() for p in self.cross_domain_fusion.parameters())
+        return total
 
     def head_parameter_count(self):
         """任务私有参数量"""
@@ -113,34 +123,34 @@ class EMFoundation(nn.Module):
         return ids
 
     def forward_mae(self, iq, sr):
-        """MAE 预训练前向：掩码 -> 编码可见 token -> 重建被掩码 patch
-
-        Returns:
-            recon: [B, n_masked_patch, 2*patch_size] 重建的 IQ patch
-            target: [B, n_masked_patch, 2*patch_size] 原始归一化 patch
-        """
-        tokens, n_patch = self.tokenizer(iq, sr)  # [B, P+2, D]
-        B = tokens.size(0)
-        keep_ids = self._random_mask(n_patch, B, tokens.device)
-        ctx = self.backbone(tokens, keep_ids=keep_ids)  # 掩码位置为 0
-
-        # 被掩码位置的目标：归一化后的原始 patch
-        iq_n = self.tokenizer.normalize(iq)
-        patches = self.tokenizer.to_patches(iq_n)  # [B,P,2*ps]
-        # 被掩码 patch 下标 = keep_ids - 2
-        masked_ids = keep_ids - 2
-        target = torch.gather(
-            patches, 1, masked_ids.unsqueeze(-1).expand(-1, -1, patches.size(-1))
-        )
-        # 重建：只解码被掩码位置的 token（位置嵌入信息由位置编码提供）
-        masked_tokens = torch.gather(ctx, 1, keep_ids.unsqueeze(-1).expand(-1, -1, ctx.size(-1)))
-        recon = self.mae_decoder(masked_tokens)
-        return recon, target
+        """真正的 masked reconstruction：编码可见 patch，解码并仅监督遮蔽 patch。"""
+        tokens, n_patch = self.tokenizer(iq, sr)
+        B, _, D = tokens.shape
+        keep_patch = self._random_mask(n_patch, B, tokens.device) - 2
+        visible_index = torch.cat([
+            torch.arange(2, device=iq.device).unsqueeze(0).expand(B, -1), keep_patch + 2], dim=1)
+        visible = torch.gather(tokens, 1, visible_index.unsqueeze(-1).expand(-1,-1,D))
+        if self.use_frequency:
+            freq = self.frequency_tokenizer(iq)
+            visible = self.cross_domain_fusion(visible, freq)
+        encoded = self.backbone(visible)
+        # 遮蔽位置只使用 learned mask token + positional encoding，绝不泄露原始 patch
+        dec = self.mask_token.expand(B, n_patch + 2, D).clone()
+        dec.scatter_(1, visible_index.unsqueeze(-1).expand(-1,-1,D), encoded)
+        dec = self.tokenizer.pos_encoding(dec)
+        reconstructed = self.mae_decoder(dec)[:, 2:]
+        target = self.tokenizer.to_patches(self.tokenizer.normalize(iq))
+        masked = torch.ones(B, n_patch, device=iq.device, dtype=torch.bool)
+        masked.scatter_(1, keep_patch, False)
+        return reconstructed[masked].reshape(B, -1, target.size(-1)), target[masked].reshape(B, -1, target.size(-1))
 
     # ------------------------------------------------------------------
     def encode(self, iq, sr):
         """共享编码：任务头使用的通用前向（无掩码，全序列）"""
         tokens, _ = self.tokenizer(iq, sr)
+        if self.use_frequency:
+            freq = self.frequency_tokenizer(iq)
+            tokens = self.cross_domain_fusion(tokens, freq)
         return self.backbone(tokens)
 
     def forward(self, iq, sr, task):

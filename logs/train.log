@@ -53,3 +53,10 @@
 2026-11-15 16:31:08,890 [INFO]   val system: acc=0.400 recall=0.125 | modulation: acc=0.050 recall=0.048 | parameter: precision=0.000
 2026-11-15 16:31:08,910 [INFO]   saved best (mean=0.1500)
 2026-11-15 16:31:08,952 [INFO] finetune done.
+2026-11-16 06:38:38,361 | INFO | pretrain | device=cpu samples=21 shared_ratio=0.891
+2026-11-16 06:38:38,384 | INFO | pretrain | epoch=1 masked_MSE=0.101793
+2026-11-16 06:38:38,394 | INFO | pretrain | saved MAE pretrained backbone
+2026-11-16 06:38:40,542 | INFO | finetune | loaded pretrained backbone from /mnt/data/workc01/smokeweights/mae_pretrained.pt
+2026-11-16 06:38:41,174 | INFO | finetune | device=cpu shared=89.11% model_params=76856
+2026-11-16 06:38:41,194 | INFO | finetune | epoch=1 train_protocol_weighted_loss=0.62438 train_modulation_weighted_loss=0.94206 train_parameter_weighted_loss=0.12648 lr=0.00000
+2026-11-16 06:38:41,205 | INFO | finetune | finished. official inference weights: /mnt/data/workc01/smokeweights/model.safetensors

@@ -16,5 +16,17 @@
   "epochs_finetune": 15,
   "warmup_ratio": 0.1,
   "num_workers": 0,
-  "ref_scale": 0.5
+  "ref_scale": 0.5,
+  "use_frequency": true,
+  "grad_clip": 1.0,
+  "seed": 42,
+  "amp": true,
+  "patience": 7,
+  "eval_every": 1,
+  "log_every": 20,
+  "task_weights": {
+    "protocol": 0.3,
+    "modulation": 0.3,
+    "parameter": 0.4
+  }
 }
