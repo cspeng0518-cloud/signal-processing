@@ -1,7 +1,8 @@
 """FFT 幅相谱 token 与时域 token 跨域融合，无 CUDA 专有依赖。"""
+import math
+
 import torch
 from torch import nn
-import torch.nn.functional as F
 
 
 class FrequencyTokenizer(nn.Module):
@@ -21,15 +22,44 @@ class FrequencyTokenizer(nn.Module):
         return self.norm(self.proj(spec))
 
 
+class CrossAttention(nn.Module):
+    """跨域多头注意力（query 与 key/value 来自不同模态，eager 实现）。
+
+    替代 nn.MultiheadAttention 黑盒接口，与 layers/attention.py 的
+    组件同风格：手写 q/k/v 投影 + 缩放点积，无掩码（频谱 token 全局可见）。
+    """
+
+    def __init__(self, d_model, nhead=4, dropout=0.0):
+        super().__init__()
+        self.nhead = nhead
+        self.head_dim = d_model // nhead
+        self.q_proj = nn.Linear(d_model, d_model)
+        self.k_proj = nn.Linear(d_model, d_model)
+        self.v_proj = nn.Linear(d_model, d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, query, key, value):
+        B, Lq, D = query.shape
+        Lk = key.size(1)
+        q = self.q_proj(query).view(B, Lq, self.nhead, self.head_dim).transpose(1, 2)
+        k = self.k_proj(key).view(B, Lk, self.nhead, self.head_dim).transpose(1, 2)
+        v = self.v_proj(value).view(B, Lk, self.nhead, self.head_dim).transpose(1, 2)
+        attn = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        attn = self.dropout(attn.softmax(dim=-1))
+        out = (attn @ v).transpose(1, 2).reshape(B, Lq, D)
+        return self.out_proj(out)
+
+
 class CrossDomainFusion(nn.Module):
     """用时域 query 对频谱 key/value 做跨注意力并门控残差融合。"""
     def __init__(self, d_model, nhead=4):
         super().__init__()
-        self.attn = nn.MultiheadAttention(d_model, nhead, batch_first=True)
+        self.attn = CrossAttention(d_model, nhead)
         self.gate = nn.Sequential(nn.Linear(2*d_model, d_model), nn.Sigmoid())
         self.norm = nn.LayerNorm(d_model)
 
     def forward(self, temporal, spectral):
-        attended, _ = self.attn(temporal, spectral, spectral, need_weights=False)
+        attended = self.attn(temporal, spectral, spectral)
         gate = self.gate(torch.cat((temporal, attended), dim=-1))
         return self.norm(temporal + gate * attended)

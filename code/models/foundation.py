@@ -18,7 +18,8 @@ import torch.nn as nn
 
 from .tokenizer import IQTokenizer, token_max_len
 from .frequency import FrequencyTokenizer, CrossDomainFusion
-from .backbone import build_backbone, RoPETransformerEncoder
+from .backbone import (build_backbone, RoPETransformerEncoder,
+                       SinTransformerEncoder)
 from .heads import ClassificationHead, RegressionHead
 
 # 官方类别数（task_schema.json）
@@ -43,15 +44,10 @@ class MAEDecoder(nn.Module):
                 dim_feedforward=4 * d_model, dropout=0.1,
                 rope_max_len=rope_max_len)
         else:
-            layer = nn.TransformerEncoderLayer(
-                d_model=d_model, nhead=nhead, dim_feedforward=4 * d_model,
-                dropout=0.1, batch_first=True, activation="gelu",
-                norm_first=True,  # pre-norm：与主干一致，深栈训练更稳
-            )
-            self.decoder = nn.TransformerEncoder(
-                layer, num_layers=n_layers,
-                norm=nn.LayerNorm(d_model),  # pre-norm 必须补 final norm
-            )
+            # 两分支均为 BaseEncoder（自建层栈 + final norm），forward 完全同构
+            self.decoder = SinTransformerEncoder(
+                d_model=d_model, n_layers=n_layers, nhead=nhead,
+                dim_feedforward=4 * d_model, dropout=0.1)
         self.proj = nn.Linear(d_model, 2 * patch_size)  # 回到 IQ patch 维
 
     def forward(self, x):

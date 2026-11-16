@@ -4,6 +4,7 @@
     forward(x, rope, pos_ids=None, key_padding_mask=None) -> [B, L, D]
 
   RoPEAttention    标准多头自注意力（q/k 按相对位置旋转）
+  FullAttention    标准多头自注意力（无旋转，sin 绝对位置编码路径专用）
   MLAAttention     DeepSeek-V2 式多头潜在注意力（KV 低秩压缩 + 解耦 RoPE）
 
 RoPEEncoderLayer  注意力 + FFN 的 pre-norm 层（RoPETransformerEncoder 与
@@ -62,6 +63,39 @@ class RoPEAttention(nn.Module):
 
         attn = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
         if key_padding_mask is not None:                           # True = 忽略
+            attn = attn.masked_fill(key_padding_mask[:, None, None, :],
+                                    float("-inf"))
+        attn = self.attn_drop(attn.softmax(dim=-1))
+        out = (attn @ v).transpose(1, 2).reshape(B, L, D)
+        return self.out_drop(self.proj(out))
+
+
+class FullAttention(nn.Module):
+    """标准多头自注意力（无位置旋转，eager 实现）。
+
+    位置信息由 tokenizer 阶段的可加性 PE 携带，注意力本身与位置无关；
+    rope / pos_ids 在此组件中被忽略（保持 forward 契约统一，可复用
+    AttentionLayer 层壳）。替代 nn.TransformerEncoderLayer 的黑盒注意力，
+    消除对 torch 内置 Transformer 接口的依赖。
+    """
+
+    def __init__(self, d_model, nhead, dropout=0.0):
+        super().__init__()
+        self.nhead = nhead
+        self.head_dim = d_model // nhead
+        self.qkv = nn.Linear(d_model, 3 * d_model)
+        self.proj = nn.Linear(d_model, d_model)
+        self.attn_drop = nn.Dropout(dropout)
+        self.out_drop = nn.Dropout(dropout)
+
+    def forward(self, x, rope=None, pos_ids=None, key_padding_mask=None):
+        B, L, D = x.shape
+        q, k, v = self.qkv(x).chunk(3, dim=-1)
+        shape = (B, L, self.nhead, self.head_dim)
+        q, k, v = (t.view(shape).transpose(1, 2) for t in (q, k, v))   # [B,H,L,Dh]
+
+        attn = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        if key_padding_mask is not None:                               # True = 忽略
             attn = attn.masked_fill(key_padding_mask[:, None, None, :],
                                     float("-inf"))
         attn = self.attn_drop(attn.softmax(dim=-1))

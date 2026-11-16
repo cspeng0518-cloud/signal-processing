@@ -8,7 +8,7 @@
   └── HybridEncoder           混合架构（full_attention/mla 按层排布，见 layers/hybrid.py）
 
 build_backbone 工厂在初始化时按 (backbone, pos_encoding) 配置选择实现；
-注意力组件（RoPEAttention / MLAAttention / RoPEEncoderLayer）见 layers/attention.py，
+注意力组件（FullAttention / RoPEAttention / MLAAttention / RoPEEncoderLayer）见 layers/attention.py，
 混合层体系（BaseSequenceLayer 及其子类）见 layers/hybrid.py，
 Mamba block（纯 torch selective scan）见 layers/mamba.py。
 """
@@ -19,8 +19,9 @@ import torch
 import torch.nn as nn
 
 from .tokenizer import RoPEPositionalEncoding  # RoPE cos/sin 旋转表（tokenizer.py 中定义）
-from .layers.attention import RoPEAttention, RoPEEncoderLayer  # 注意力组件
-from .layers.hybrid import build_sequence_layer, normalize_layer_type  # 混合层工厂与类型归一
+from .layers.attention import RoPEAttention, RoPEEncoderLayer, FullAttention  # 注意力组件
+from .layers.hybrid import (build_sequence_layer, normalize_layer_type,   # 混合层工厂与类型归一
+                            AttentionLayer)                                # pre-norm 层壳
 from .layers.mamba import MambaBlock  # 纯 torch 原生 Mamba（无 mamba_ssm 依赖）
 
 
@@ -74,22 +75,26 @@ class BaseEncoder(nn.Module, ABC):
 class SinTransformerEncoder(BaseEncoder):
     """绝对正弦位置编码 Transformer（默认）。
 
-    位置信息在 tokenizer 阶段以可加性 PE 叠加进 token，编码本身与位置无关，
+    位置信息在 tokenizer 阶段以可加性 PE 叠加进 token，注意力本身与位置无关，
     pos_ids 参数在此实现中被忽略（保持接口统一）。
+    层结构复用 AttentionLayer 层壳（pre-norm + SwiGLU），注意力核心为
+    FullAttention——不依赖 torch 内置 nn.TransformerEncoder 黑盒接口。
     """
 
-    def __init__(self, d_model=128, n_layers=12, nhead=4, dim_feedforward=4 * 128,
+    def __init__(self, d_model=128, n_layers=12, nhead=4, dim_feedforward=None,
                  dropout=0.1, rope_max_len=None):
         super().__init__(d_model)
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model, nhead=nhead, dim_feedforward=dim_feedforward,
-            dropout=dropout, batch_first=True, activation="gelu",
-            norm_first=True,  # pre-norm：深栈梯度稳定（final norm 由基类 self.norm 提供）
-        )
-        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        if dim_feedforward is None:
+            dim_feedforward = 4 * d_model
+        self.layers = nn.ModuleList(
+            [AttentionLayer(FullAttention(d_model, nhead, dropout),
+                            d_model, dim_feedforward, dropout)
+             for _ in range(n_layers)])
 
     def _encode(self, x, pos_ids=None, key_padding_mask=None):
-        return self.encoder(x, src_key_padding_mask=key_padding_mask)
+        for layer in self.layers:
+            x = layer(x, None, pos_ids, key_padding_mask)   # rope 不适用（无旋转）
+        return x
 
 
 class RoPETransformerEncoder(BaseEncoder):
