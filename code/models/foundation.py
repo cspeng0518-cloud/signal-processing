@@ -16,9 +16,9 @@ MAE 预训练（任务无关）：mask 掉部分 patch token，backbone 编码�
 import torch
 import torch.nn as nn
 
-from .tokenizer import IQTokenizer
+from .tokenizer import IQTokenizer, token_max_len
 from .frequency import FrequencyTokenizer, CrossDomainFusion
-from .backbone import build_backbone
+from .backbone import build_backbone, RoPETransformerEncoder
 from .heads import ClassificationHead, RegressionHead
 
 # 官方类别数（task_schema.json）
@@ -28,15 +28,26 @@ N_PARAMS = 7
 
 
 class MAEDecoder(nn.Module):
-    """轻量 MAE 解码器（仅预训练使用，微调/推理时丢弃）"""
+    """轻量 MAE 解码器（仅预训练使用，微调/推理时丢弃）
 
-    def __init__(self, d_model=128, patch_size=8, n_layers=2, nhead=4):
+    pos_encoding 与主干保持一致："sin" 时输入 token 已含可加性位置编码；
+    "rope" 时解码注意力内部旋转（全序列 0..L-1 位置），输入无需叠加位置向量。
+    """
+
+    def __init__(self, d_model=128, patch_size=8, n_layers=2, nhead=4,
+                 pos_encoding="sin", rope_max_len=512):
         super().__init__()
-        layer = nn.TransformerEncoderLayer(
-            d_model=d_model, nhead=nhead, dim_feedforward=4 * d_model,
-            dropout=0.1, batch_first=True, activation="gelu",
-        )
-        self.decoder = nn.TransformerEncoder(layer, num_layers=n_layers)
+        if pos_encoding == "rope":
+            self.decoder = RoPETransformerEncoder(
+                d_model=d_model, n_layers=n_layers, nhead=nhead,
+                dim_feedforward=4 * d_model, dropout=0.1,
+                rope_max_len=rope_max_len)
+        else:
+            layer = nn.TransformerEncoderLayer(
+                d_model=d_model, nhead=nhead, dim_feedforward=4 * d_model,
+                dropout=0.1, batch_first=True, activation="gelu",
+            )
+            self.decoder = nn.TransformerEncoder(layer, num_layers=n_layers)
         self.proj = nn.Linear(d_model, 2 * patch_size)  # 回到 IQ patch 维
 
     def forward(self, x):
@@ -51,18 +62,25 @@ class EMFoundation(nn.Module):
         patch_size = config.get("patch_size", 8)
         sr_bins = config.get("sr_bins", 64)
         mask_ratio = config.get("mask_ratio", 0.75)
+        pos_encoding = config.get("pos_encoding", "sin")  # "sin" | "rope"
+        rope_max_len = token_max_len(patch_size)
 
         # ---- 共享部分（各任务权重共用的核心）----
-        self.tokenizer = IQTokenizer(d_model, patch_size, sr_bins)
+        self.tokenizer = IQTokenizer(d_model, patch_size, sr_bins,
+                                     pos_encoding=pos_encoding)
         self.backbone = build_backbone(
             backbone_name,
             d_model=d_model,
             n_layers=config.get("n_layers", 12),
             nhead=config.get("nhead", 4),
+            pos_encoding=pos_encoding,
+            rope_max_len=rope_max_len,
         )
         # ---- MAE 预训练专用 ----
         self.mae_decoder = MAEDecoder(
-            d_model, patch_size, config.get("mae_decoder_layers", 2)
+            d_model, patch_size, config.get("mae_decoder_layers", 2),
+            nhead=config.get("nhead", 4), pos_encoding=pos_encoding,
+            rope_max_len=rope_max_len,
         )
         self.mask_ratio = mask_ratio
         self.use_frequency = bool(config.get("use_frequency", True))
@@ -130,7 +148,7 @@ class EMFoundation(nn.Module):
             recon:  [B, n_masked, 2*patch_size] 被掩码 patch 的重建值
             target: [B, n_masked, 2*patch_size] 被掩码 patch 的归一化原始值
         """
-        tokens, n_patch = self.tokenizer(iq, sr)  # token 已含位置编码
+        tokens, n_patch = self.tokenizer(iq, sr)  # sin 模式下 token 已含位置编码
         B, _, D = tokens.shape
 
         # ---- 1. 采样掩码，收集可见 token（CLS/SR 永不掩码）----
@@ -141,13 +159,17 @@ class EMFoundation(nn.Module):
         visible = torch.gather(tokens, 1, visible_index.unsqueeze(-1).expand(-1, -1, D))
         if self.use_frequency:
             visible = self.cross_domain_fusion(visible, self.frequency_tokenizer(iq))
-        encoded = self.backbone(visible)  # 仅编码可见 token（MAE 加速路径）
+        # 仅编码可见 token（MAE 加速路径）；pos_ids 传原始下标，
+        # 依赖位置的实现（RoPE）据此保持真实位置，其余实现忽略
+        encoded = self.backbone(visible, pos_ids=visible_index)
 
         # ---- 2. 解码端全序列：可见位用 encoded，掩码位用 mask token ----
-        # encoded 已含 tokenizer 阶段的位置编码，因此只给 mask token 补位置编码，
-        # 避免可见 token 被重复叠加两次位置编码。
-        pos = self.tokenizer.pos_encoding.pe[:, : n_patch + 2]           # [1,L,D]
-        dec = self.mask_token.expand(B, n_patch + 2, D).clone() + pos    # 掩码位
+        dec = self.mask_token.expand(B, n_patch + 2, D).clone()
+        if self.tokenizer.pos_encoding is not None:
+            # 可加性位置编码：encoded 已含 tokenizer 阶段的 PE，只给 mask token
+            # 补位置编码，避免可见 token 被重复叠加两次位置编码；
+            # rope 模式无叠加，位置由解码注意力携带
+            dec = dec + self.tokenizer.pos_encoding.pe[:, : n_patch + 2]
         dec.scatter_(1, visible_index.unsqueeze(-1).expand(-1, -1, D), encoded)
         reconstructed = self.mae_decoder(dec)[:, 2:]                     # 丢掉 CLS/SR 位
 

@@ -5,6 +5,7 @@
   "nhead": 4,
   "patch_size": 8,
   "sr_bins": 64,
+  "pos_encoding": "sin",
   "mask_ratio": 0.75,
   "mae_decoder_layers": 2,
   "head_hidden": 256,

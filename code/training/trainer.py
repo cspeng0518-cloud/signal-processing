@@ -1,0 +1,281 @@
+"""训练器：生命周期基类 + 两阶段派生实现。
+
+BaseTrainer               fit() 封装完整生命周期（optimizer/scheduler/scaler 构建、
+                          resume、epoch 循环、断点保存、指标记录），子类按钩子填充差异
+├── MAEPretrainer         掩码重建预训练；train_one_epoch 唯一必填钩子，结束导出 mae_pretrained.pt
+└── MultitaskFinetuner    三任务轮转微调；on_epoch_end 评估+代理得分+best 导出，should_stop 早停
+
+入口脚本只负责：参数/配置/数据组装 -> 实例化对应 Trainer -> fit()。
+"""
+
+import json
+from abc import ABC, abstractmethod
+from pathlib import Path
+
+import torch
+from safetensors.torch import save_file
+
+from training.common import ROOT
+from training.tasks import TASKS, TASK_ORDER
+from utils.checkpoint import load_checkpoint, save_checkpoint
+from utils.dataset import save_param_stats
+from utils.logger import record_metrics
+from utils.train_utils import autocast_context, build_scheduler, optimizer_step
+
+
+# ================================================================ 导出
+def export_pretrained(model, out_dir):
+    """导出 MAE 预训练共享权重（tokenizer/backbone/频域分支）。"""
+    state = {k: v for k, v in model.state_dict().items()
+             if not k.startswith("task_heads")}
+    torch.save(state, Path(out_dir) / "mae_pretrained.pt")
+
+
+def export_model(model, cfg, param_stats, out_dir):
+    """导出官方推理格式（config.json + model.safetensors + param_stats.npz）。"""
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "config.json").write_text(
+        json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
+    save_file({k: v.contiguous().clone() for k, v in model.state_dict().items()},
+              str(out_dir / "model.safetensors"))
+    save_param_stats(param_stats, out_dir)
+
+
+# ================================================================ 基类
+class BaseTrainer(ABC):
+    """训练生命周期骨架。
+
+    子类钩子（除 train_one_epoch / scheduler_total_steps / n_epochs 必填外均可选）:
+      train_parameters       优化器参数（预训练排除任务头）
+      on_epoch_end           epoch 末回调（评估/导出），返回追加进 metrics 的 dict
+      checkpoint_extra       断点附加状态（如 finetune 的 best/bad）
+      on_resume              从断点恢复附加状态
+      should_stop            早停条件
+      on_finish              fit 结束回调（导出等）
+    """
+
+    tag = "train"          # metrics jsonl 命名
+    resume_name = None     # 断点文件名（子类必填）
+
+    def __init__(self, cfg, model, device, logger, out_dir,
+                 resume=None, smoke_steps=0):
+        self.cfg = cfg
+        self.model = model
+        self.device = device
+        self.logger = logger
+        self.out_dir = Path(out_dir)
+        self.smoke_steps = smoke_steps
+        self.start_epoch = 0
+        self.optimizer = torch.optim.AdamW(
+            self.train_parameters(), lr=cfg["lr"], weight_decay=cfg["weight_decay"])
+        self.scheduler = build_scheduler(
+            self.optimizer, self.scheduler_total_steps(),
+            cfg.get("warmup_ratio", 0.1))
+        self.scaler = torch.amp.GradScaler(
+            "cuda", enabled=(device.type == "cuda" and cfg.get("amp", True)))
+        if resume:
+            self.start_epoch, extra = load_checkpoint(
+                resume, model=model, optimizer=self.optimizer,
+                scheduler=self.scheduler, scaler=self.scaler)
+            self.on_resume(extra)
+            logger.info("resumed from %s at epoch %d", resume, self.start_epoch)
+
+    # ---------------- 钩子 ----------------
+    def train_parameters(self):
+        return self.model.parameters()
+
+    @abstractmethod
+    def train_one_epoch(self):
+        """一个 epoch 的训练，返回指标 dict。"""
+
+    @abstractmethod
+    def scheduler_total_steps(self):
+        """调度器总步数（决定 warmup + cosine 形状）。"""
+
+    @abstractmethod
+    def n_epochs(self):
+        """总 epoch 数。"""
+
+    def on_epoch_end(self, epoch):
+        return {}
+
+    def checkpoint_extra(self):
+        return {}
+
+    def on_resume(self, extra):
+        pass
+
+    def should_stop(self):
+        return False
+
+    def on_finish(self):
+        pass
+
+    # ---------------- 生命周期 ----------------
+    def fit(self):
+        for epoch in range(self.start_epoch, self.n_epochs()):
+            values = self.train_one_epoch()
+            values["lr"] = self.scheduler.get_last_lr()[0]
+            values.update(self.on_epoch_end(epoch))
+            record_metrics(ROOT / "logs", self.tag, epoch + 1, values)
+            self.logger.info("epoch=%d %s", epoch + 1,
+                             " ".join(f"{k}={v:.5f}" for k, v in values.items()))
+            save_checkpoint(self.out_dir / self.resume_name, epoch=epoch,
+                            model=self.model, optimizer=self.optimizer,
+                            scheduler=self.scheduler, scaler=self.scaler,
+                            **self.checkpoint_extra())
+            if self.smoke_steps:
+                break
+            if self.should_stop():
+                self.logger.info("early stopping at epoch %d", epoch + 1)
+                break
+        self.on_finish()
+
+
+# ================================================================ 子类
+class MAEPretrainer(BaseTrainer):
+    """阶段一：MAE 掩码重建自监督预训练（任务头不参与）。"""
+
+    tag = "pretrain"
+    resume_name = "mae_resume.pt"
+
+    def __init__(self, cfg, model, device, logger, out_dir, loader,
+                 resume=None, smoke_steps=0):
+        self.loader = loader  # 须在 super().__init__ 前就位（调度器构建依赖）
+        super().__init__(cfg, model, device, logger, out_dir, resume, smoke_steps)
+        self.out_dir.mkdir(parents=True, exist_ok=True)
+        logger.info("device=%s samples=%d shared_ratio=%.3f",
+                    device, len(loader.dataset), model.shared_ratio())
+
+    def train_parameters(self):
+        # 任务头无梯度，不参与预训练
+        return [p for name, p in self.model.named_parameters()
+                if not name.startswith("task_heads")]
+
+    def n_epochs(self):
+        return self.cfg["epochs_pretrain"]
+
+    def scheduler_total_steps(self):
+        steps = len(self.loader)
+        if self.smoke_steps:
+            steps = min(steps, self.smoke_steps)
+        return max(1, steps * self.cfg["epochs_pretrain"])
+
+    def train_one_epoch(self):
+        self.model.train()
+        total, count = 0.0, 0
+        for step, (iq, sr) in enumerate(self.loader):
+            if self.smoke_steps and step >= self.smoke_steps:
+                break
+            iq, sr = iq.to(self.device), sr.to(self.device)
+            with autocast_context(self.device, self.cfg.get("amp", True)):
+                recon, target = self.model.forward_mae(iq, sr)
+                loss = (recon.float() - target.float()).square().mean()
+            optimizer_step(loss, self.optimizer, self.model, self.scaler,
+                           self.cfg.get("grad_clip", 1.0))
+            self.scheduler.step()
+            total += loss.item() * iq.size(0)
+            count += iq.size(0)
+        return {"recon_mse": total / max(1, count)}
+
+    def on_finish(self):
+        export_pretrained(self.model, self.out_dir)
+        self.logger.info("saved MAE pretrained weights -> %s",
+                         self.out_dir / "mae_pretrained.pt")
+
+
+class MultitaskFinetuner(BaseTrainer):
+    """阶段二：单 backbone 多任务微调（protocol/modulation/parameter 轮转）。"""
+
+    tag = "finetune"
+    resume_name = "finetune_resume.pt"
+
+    def __init__(self, cfg, model, device, logger, out_dir, loaders, param_stats,
+                 resume=None, smoke_steps=0):
+        self.loaders = loaders
+        self.param_stats = param_stats
+        self.weights = cfg.get("task_weights",
+                               {"protocol": 0.3, "modulation": 0.3, "parameter": 0.4})
+        self.best, self.bad = -float("inf"), 0  # 须在 super().__init__ 前（resume 依赖）
+        super().__init__(cfg, model, device, logger, out_dir, resume, smoke_steps)
+
+    def n_epochs(self):
+        return self.cfg["epochs_finetune"]
+
+    def steps_per_epoch(self):
+        steps = max(len(self.loaders["train"][t]) for t in TASK_ORDER)
+        return min(steps, self.smoke_steps) if self.smoke_steps else steps
+
+    def scheduler_total_steps(self):
+        # 每步依次更新三个任务 -> 每 epoch 优化步数 = steps * len(TASK_ORDER)
+        return max(1, self.steps_per_epoch() * len(TASK_ORDER)
+                   * self.cfg["epochs_finetune"])
+
+    def train_one_epoch(self):
+        self.model.train()
+        n_steps = self.steps_per_epoch()
+        iters = {t: iter(self.loaders["train"][t]) for t in TASK_ORDER}
+        losses = {t: 0.0 for t in TASK_ORDER}
+        for _ in range(n_steps):
+            for task in TASK_ORDER:
+                batch = next_batch(iters, self.loaders["train"], task)
+                batch = {k: v.to(self.device) for k, v in batch.items()}
+                with autocast_context(self.device, self.cfg.get("amp", True)):
+                    feat = self.model.encode(batch["iq"], batch["sr"])
+                    loss = TASKS[task].loss(self.model, feat, batch, self.cfg)
+                    loss = loss * float(self.weights[task])
+                optimizer_step(loss, self.optimizer, self.model, self.scaler,
+                               self.cfg.get("grad_clip", 1.0))
+                self.scheduler.step()
+                losses[task] += loss.item()
+        return {f"train_{t}_weighted_loss": losses[t] / max(1, n_steps)
+                for t in TASK_ORDER}
+
+    def on_epoch_end(self, epoch):
+        if self.smoke_steps or (epoch + 1) % self.cfg.get("eval_every", 1) != 0:
+            return {}
+        if any(t not in self.loaders.get("val", {}) for t in TASK_ORDER):
+            raise RuntimeError("missing validation split for one or more tasks")
+        results = {t: TASKS[t].evaluate(self.model, self.loaders["val"][t],
+                                        self.device, self.param_stats,
+                                        self.cfg.get("ref_scale", 0.5))
+                   for t in TASK_ORDER}
+        values = {f"val_{t}_{k}": v for t, m in results.items() for k, v in m.items()}
+        score = (0.3 * results["protocol"]["acc"]
+                 + 0.3 * results["modulation"]["acc"]
+                 + 0.4 * results["parameter"]["precision"])
+        values["val_proxy_score"] = score
+        if score > self.best:
+            self.best, self.bad = score, 0
+            export_model(self.model, self.cfg, self.param_stats, self.out_dir)
+            self.logger.info("new best proxy score=%.5f", self.best)
+        else:
+            self.bad += 1
+        return values
+
+    def checkpoint_extra(self):
+        return {"best": self.best, "bad": self.bad}
+
+    def on_resume(self, extra):
+        self.best = extra.get("best", -float("inf"))
+        self.bad = extra.get("bad", 0)
+
+    def should_stop(self):
+        return self.bad >= self.cfg.get("patience", 7)
+
+    def on_finish(self):
+        if self.smoke_steps:
+            export_model(self.model, self.cfg, self.param_stats, self.out_dir)
+        self.logger.info("finished; official inference weights: %s",
+                         self.out_dir / "model.safetensors")
+
+
+# ================================================================ 工具
+def next_batch(iters, loader, task):
+    """循环取 batch：迭代器耗尽时自动重开。"""
+    try:
+        return next(iters[task])
+    except StopIteration:
+        iters[task] = iter(loader[task])
+        return next(iters[task])
