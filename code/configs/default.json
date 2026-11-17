@@ -28,8 +28,8 @@
   },
   "training": {
     "seq_len": 1024,
-    "batch_size": 2048,
-    "lr": 0.001,
+    "batch_size": 512,
+    "lr": 0.0001,
     "weight_decay": 0.05,
     "epochs_pretrain": 50,
     "epochs_finetune": 60,

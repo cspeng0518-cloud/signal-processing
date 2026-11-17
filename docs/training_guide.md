@@ -119,6 +119,34 @@ python code/training/finetune_multitask.py --data_dir datasets --out_dir weights
 Pass criteria: both scripts exit without errors, checkpoint files appear under
 `weights/`, and the log ends with `recon_mse=...` / `train_*_weighted_loss=...`.
 
+### 4.1.1 Multi-Card Launch (single A800 GPU / multi-card 910C NPU)
+
+Both stages run unchanged on a single card (plain `python`, as shown above).
+On multiple cards launch with `torchrun` — the backend is picked automatically
+(`nccl` on CUDA GPUs, `hccl` on Ascend NPUs):
+
+```bash
+# 8x Ascend 910C example (use --nproc_per_node=<number of cards>)
+torchrun --nproc_per_node=8 code/training/pretrain_mae.py \
+    --data_dir datasets --out_dir weights
+
+torchrun --nproc_per_node=8 code/training/finetune_multitask.py \
+    --data_dir datasets --out_dir weights --eval_test
+```
+
+How multi-card training works here:
+
+- `training.batch_size` is the **per-card** batch; the effective batch is
+  `batch_size × nproc_per_node` — scale `training.lr` accordingly if you change
+  the card count
+- Train splits are sharded with `DistributedSampler`; gradients are averaged
+  across cards after every step (manual all-reduce, no DDP wrapper — the model
+  has multiple custom forward entries and MAE leaves task heads unused)
+- All ranks use the same seed, so weights stay bit-identical across cards
+- Only rank 0 writes logs / TensorBoard / checkpoints / exports; validation and
+  the early-stopping decision run on rank 0 and the stop flag is broadcast so
+  every rank exits in step
+
 ### 4.2 Stage 1: MAE Self-Supervised Pretraining (task-agnostic)
 
 ```bash

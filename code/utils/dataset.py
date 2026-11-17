@@ -28,6 +28,7 @@ import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import Dataset, DataLoader
+from torch.utils.data.distributed import DistributedSampler
 
 PARAM_NAMES = [
     "symbol_rate", "bandwidth", "frequency_shift",
@@ -293,12 +294,16 @@ def compute_param_stats(parquet_path):
 
 
 def build_task_dataloaders(data_dir, batch_size=32, seq_len=1024, splits=("train", "val"),
-                           tasks=("protocol", "modulation", "parameter"), num_workers=0):
+                           tasks=("protocol", "modulation", "parameter"), num_workers=0,
+                           rank=0, world_size=1):
     """构建多任务 DataLoader 字典
 
     优先使用预处理 memmap 布局（{task}/iq.memap + meta.json，val/test 划分在 meta 内），
     否则退回 Parquet 布局（{split}_{task}.parquet，模拟数据 data_gen.py 产出）。
     splits 可含 "test"（仅供训练后无偏评估，见 finetune_multitask.py --eval_test）。
+
+    多卡（world_size > 1）时 train 划分用 DistributedSampler 分片（batch_size
+    为单卡批量，总批量 = batch_size × world_size）；val/test 不分片，仅主卡评估。
 
     Returns:
         loaders = {
@@ -321,10 +326,17 @@ def build_task_dataloaders(data_dir, batch_size=32, seq_len=1024, splits=("train
                                        param_stats=param_stats if task == "parameter" else None)
             except FileNotFoundError:
                 continue
-            loaders[split][task] = DataLoader(
-                ds, batch_size=batch_size, shuffle=(split == "train"),
-                collate_fn=collate_fn, num_workers=num_workers,
-            )
+            if split == "train" and world_size > 1:
+                sampler = DistributedSampler(
+                    ds, num_replicas=world_size, rank=rank, shuffle=True)
+                loaders[split][task] = DataLoader(
+                    ds, batch_size=batch_size, sampler=sampler,
+                    collate_fn=collate_fn, num_workers=num_workers)
+            else:
+                loaders[split][task] = DataLoader(
+                    ds, batch_size=batch_size, shuffle=(split == "train"),
+                    collate_fn=collate_fn, num_workers=num_workers,
+                )
     return loaders, param_stats
 
 

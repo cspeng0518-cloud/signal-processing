@@ -4,15 +4,19 @@ import logging
 from pathlib import Path
 
 
-def get_logger(name, log_dir, file_name="train.log"):
-    directory = Path(log_dir)
-    directory.mkdir(parents=True, exist_ok=True)
+def get_logger(name, log_dir, file_name="train.log", quiet=False):
+    """quiet=True 时返回无 handler 的静默 logger（多卡训练的非主卡进程用，
+    避免多进程并发写同一日志文件）。"""
     logger = logging.getLogger(name)
-    logger.setLevel(logging.INFO)
+    logger.setLevel(logging.ERROR if quiet else logging.INFO)
     logger.propagate = False
     for handler in logger.handlers[:]:
         handler.close()
         logger.removeHandler(handler)
+    if quiet:
+        return logger
+    directory = Path(log_dir)
+    directory.mkdir(parents=True, exist_ok=True)
     fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s")
     for handler in (logging.StreamHandler(), logging.FileHandler(directory / file_name, encoding="utf-8")):
         handler.setFormatter(fmt)

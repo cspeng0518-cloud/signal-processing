@@ -1,8 +1,9 @@
 """阶段二：单 backbone 多任务微调（protocol / modulation / parameter）。
 
 用法:
-  python training/finetune_multitask.py --data_dir <dir> [--from_mae ...]
-                                       [--config ...] [--resume ...]
+  python training/finetune_multitask.py --data_dir <dir> [--from_mae ...]      # 单卡
+                                       [--config ...] [--resume ...] [--eval_test]
+  torchrun --nproc_per_node=N training/finetune_multitask.py --data_dir <dir> [...]  # 多卡
 
 本文件只负责：参数/配置/数据组装 -> 多任务微调 -> fit()。
 训练生命周期（调度/断点/早停/评估/导出）见 training/trainer.py，
@@ -21,7 +22,7 @@ from training.tasks import TASK_ORDER, TASKS
 from training.trainer import MultitaskFinetuner
 from utils.dataset import build_task_dataloaders
 from utils.logger import get_logger
-from utils.train_utils import get_device, seed_all
+from utils.train_utils import get_device, init_distributed, seed_all, teardown_distributed
 
 MAX_TOTAL_PARAMS = 1_000_000_000   # 赛题红线：总参数量 < 1B
 MIN_SHARED_RATIO = 0.80            # 赛题红线：权重共用率 > 80%
@@ -74,14 +75,16 @@ def main():
 
     cfg = load_config(args.config)
     train_cfg = cfg["training"]
-    seed_all(train_cfg.get("seed", 42))
-    device = get_device()
-    logger = get_logger("finetune", ROOT / "logs")
+    seed_all(train_cfg.get("seed", 42))  # 各卡同 seed：初始化一致 + 梯度平均 => 权重同步
+    device, rank, world_size, is_main = init_distributed()
+    if device is None:
+        device = get_device()
+    logger = get_logger("finetune", ROOT / "logs", quiet=not is_main)
 
-    # ---- 数据 ----
+    # ---- 数据（多卡时 train 划分 DistributedSampler 分片，val/test 不分片） ----
     loaders, param_stats = build_task_dataloaders(
         args.data_dir, batch_size=train_cfg["batch_size"], seq_len=train_cfg["seq_len"],
-        num_workers=train_cfg.get("num_workers", 0))
+        num_workers=train_cfg.get("num_workers", 0), rank=rank, world_size=world_size)
     missing = [t for t in TASK_ORDER if t not in loaders["train"]]
     if missing:
         raise RuntimeError(f"missing required train tasks: {missing}")
@@ -97,11 +100,14 @@ def main():
 
     MultitaskFinetuner(cfg, model, device, logger, out_dir=args.out_dir,
                        loaders=loaders, param_stats=param_stats,
-                       resume=args.resume, smoke_steps=args.smoke_steps).fit()
+                       resume=args.resume, smoke_steps=args.smoke_steps,
+                       rank=rank, world_size=world_size).fit()
 
-    if args.eval_test:
+    # test 无偏评估单进程足够（主卡做，各卡权重同步结果一致）
+    if args.eval_test and is_main:
         evaluate_on_test(model, args.data_dir, train_cfg, param_stats,
                          device, logger, args.out_dir)
+    teardown_distributed()
 
 
 if __name__ == "__main__":

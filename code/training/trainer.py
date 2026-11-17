@@ -21,7 +21,8 @@ from training.tasks import TASKS, TASK_ORDER
 from utils.checkpoint import load_checkpoint, save_checkpoint
 from utils.dataset import save_param_stats
 from utils.logger import plot_metrics, plot_step_metrics, record_metrics, record_step
-from utils.train_utils import autocast_context, build_scheduler, optimizer_step, tqdm
+from utils.train_utils import autocast_context, broadcast_flag, build_scheduler, \
+    optimizer_step, tqdm
 
 
 # ================================================================ 导出
@@ -60,7 +61,7 @@ class BaseTrainer(ABC):
     resume_name = None     # 断点文件名（子类必填）
 
     def __init__(self, cfg, model, device, logger, out_dir,
-                 resume=None, smoke_steps=0):
+                 resume=None, smoke_steps=0, rank=0, world_size=1):
         self.cfg = cfg                      # 完整配置（导出 config.json 用）
         self.tcfg = cfg["training"]         # 训练参数（optimizer/scheduler/epoch 等）
         self.model = model
@@ -68,6 +69,9 @@ class BaseTrainer(ABC):
         self.logger = logger
         self.out_dir = Path(out_dir)
         self.smoke_steps = smoke_steps
+        self.rank = rank                    # 多卡：本进程卡号（0 为主卡）
+        self.world_size = world_size        # 多卡：总卡数（单卡为 1）
+        self.is_main = rank == 0
         self.start_epoch = 0
         self.optimizer = torch.optim.AdamW(
             self.train_parameters(), lr=self.tcfg["lr"],
@@ -80,9 +84,11 @@ class BaseTrainer(ABC):
         self.scaler = torch.amp.GradScaler(
             "cuda", enabled=(device.type == "cuda" and self.tcfg.get("amp_dtype") == "fp16"))
         # TensorBoard 可视化（train/loss、train/grad_norm、train/lr 等；tag 区分阶段）
+        # 多卡时仅主卡写（事件文件/日志/断点均由主卡独占，避免多进程写坏文件）
         self.global_step = 0
         self._epoch = 0
-        self.writer = SummaryWriter(log_dir=str(ROOT / "logs" / "tb" / self.tag))
+        self.writer = (SummaryWriter(log_dir=str(ROOT / "logs" / "tb" / self.tag))
+                       if self.is_main else None)
         if resume:
             self.start_epoch, extra = load_checkpoint(
                 resume, model=model, optimizer=self.optimizer,
@@ -121,9 +127,11 @@ class BaseTrainer(ABC):
     def on_finish(self):
         pass
 
-    # ---------------- 可视化 ----------------
+    # ---------------- 可视化（仅主卡生效） ----------------
     def _log_scalars(self, values):
         """step 级指标写 TensorBoard + step jsonl（含 epoch，供 step 级出图）。"""
+        if not self.is_main:
+            return
         for k, v in values.items():
             self.writer.add_scalar(k, v, self.global_step)
         record_step(ROOT / "logs", self.tag, self.global_step,
@@ -131,45 +139,67 @@ class BaseTrainer(ABC):
 
     def _log_epoch(self, values, epoch):
         """epoch 级指标写 TensorBoard（epoch/ 前缀；jsonl 由 record_metrics 落盘）。"""
+        if not self.is_main:
+            return
         for k, v in values.items():
             if isinstance(v, (int, float)):
                 self.writer.add_scalar(f"epoch/{k}", v, epoch)
         self.writer.flush()
+
+    # ---------------- 多卡 ----------------
+    def _train_loaders(self):
+        """本阶段的训练 loader 列表（子类按需覆写）。"""
+        return []
+
+    def _set_sampler_epoch(self, epoch):
+        """多卡时同步 DistributedSampler 的打乱种子（各 epoch 数据划分不同）。"""
+        if self.world_size < 2:
+            return
+        for loader in self._train_loaders():
+            sampler = getattr(loader, "sampler", None)
+            if hasattr(sampler, "set_epoch"):
+                sampler.set_epoch(epoch)
 
     # ---------------- 生命周期 ----------------
     def fit(self):
         try:
             for epoch in range(self.start_epoch, self.n_epochs()):
                 self._epoch = epoch
+                self._set_sampler_epoch(epoch)
                 values = self.train_one_epoch()
                 values["lr"] = self.scheduler.get_last_lr()[0]
                 values.update(self.on_epoch_end(epoch))
-                record_metrics(ROOT / "logs", self.tag, epoch + 1, values)
-                self.logger.info("epoch=%d %s", epoch + 1,
-                                 " ".join(f"{k}={v:.5f}" for k, v in values.items()))
-                self._log_epoch(values, epoch + 1)
-                save_checkpoint(self.out_dir / self.resume_name, epoch=epoch,
-                                model=self.model, optimizer=self.optimizer,
-                                scheduler=self.scheduler, scaler=self.scaler,
-                                **self.checkpoint_extra())
+                if self.is_main:
+                    record_metrics(ROOT / "logs", self.tag, epoch + 1, values)
+                    self.logger.info("epoch=%d %s", epoch + 1,
+                                     " ".join(f"{k}={v:.5f}" for k, v in values.items()))
+                    self._log_epoch(values, epoch + 1)
+                    save_checkpoint(self.out_dir / self.resume_name, epoch=epoch,
+                                    model=self.model, optimizer=self.optimizer,
+                                    scheduler=self.scheduler, scaler=self.scaler,
+                                    **self.checkpoint_extra())
                 if self.smoke_steps:
                     break
-                if self.should_stop():
+                # 早停由主卡判定（val 评估只在主卡做），广播保证各卡同步退出
+                stop = self.should_stop() if self.is_main else False
+                if broadcast_flag(stop, self.device, self.world_size):
                     self.logger.info("early stopping at epoch %d", epoch + 1)
                     break
         finally:
-            self.writer.close()
-        # 训练结束后自动绘制指标曲线图
+            if self.writer is not None:
+                self.writer.close()
+        # 训练结束后自动绘制指标曲线图（仅主卡）
         # epoch 级：logs/plots/<tag>_<group>.png；step 级（含 epoch 分界标注）：
         # logs/plots/<tag>_step_<group>.png
-        for png in plot_metrics(ROOT / "logs" / f"{self.tag}_metrics.jsonl",
-                                ROOT / "logs" / "plots", self.tag):
-            self.logger.info("plot saved: %s", png)
-        for png in plot_step_metrics(ROOT / "logs" / f"{self.tag}_steps.jsonl",
-                                     ROOT / "logs" / "plots", self.tag,
-                                     ROOT / "logs" / f"{self.tag}_metrics.jsonl"):
-            self.logger.info("step plot saved: %s", png)
-        self.on_finish()
+        if self.is_main:
+            for png in plot_metrics(ROOT / "logs" / f"{self.tag}_metrics.jsonl",
+                                    ROOT / "logs" / "plots", self.tag):
+                self.logger.info("plot saved: %s", png)
+            for png in plot_step_metrics(ROOT / "logs" / f"{self.tag}_steps.jsonl",
+                                         ROOT / "logs" / "plots", self.tag,
+                                         ROOT / "logs" / f"{self.tag}_metrics.jsonl"):
+                self.logger.info("step plot saved: %s", png)
+            self.on_finish()
 
 
 # ================================================================ 子类
@@ -180,12 +210,16 @@ class MAEPretrainer(BaseTrainer):
     resume_name = "mae_resume.pt"
 
     def __init__(self, cfg, model, device, logger, out_dir, loader,
-                 resume=None, smoke_steps=0):
+                 resume=None, smoke_steps=0, rank=0, world_size=1):
         self.loader = loader  # 须在 super().__init__ 前就位（调度器构建依赖）
-        super().__init__(cfg, model, device, logger, out_dir, resume, smoke_steps)
+        super().__init__(cfg, model, device, logger, out_dir, resume, smoke_steps,
+                         rank, world_size)
         self.out_dir.mkdir(parents=True, exist_ok=True)
-        logger.info("device=%s samples=%d shared_ratio=%.3f",
-                    device, len(loader.dataset), model.shared_ratio())
+        logger.info("device=%s samples=%d world_size=%d shared_ratio=%.3f",
+                    device, len(loader.dataset), world_size, model.shared_ratio())
+
+    def _train_loaders(self):
+        return [self.loader]
 
     def train_parameters(self):
         # 任务头无梯度，不参与预训练
@@ -207,7 +241,8 @@ class MAEPretrainer(BaseTrainer):
         norms = []
         desc = f"pretrain epoch {self._epoch + 1}/{self.n_epochs()}"
         for step, (iq, sr) in enumerate(tqdm(self.loader, desc=desc,
-                                             leave=False, dynamic_ncols=True)):
+                                             leave=False, dynamic_ncols=True,
+                                             disable=not self.is_main)):
             if self.smoke_steps and step >= self.smoke_steps:
                 break
             iq, sr = iq.to(self.device), sr.to(self.device)
@@ -215,7 +250,8 @@ class MAEPretrainer(BaseTrainer):
                 recon, target = self.model.forward_mae(iq, sr)
                 loss = (recon.float() - target.float()).square().mean()
             grad_norm = optimizer_step(loss, self.optimizer, self.model, self.scaler,
-                                       self.tcfg.get("grad_clip", 1.0))
+                                       self.tcfg.get("grad_clip", 1.0),
+                                       world_size=self.world_size)
             self.scheduler.step()
             loss_v = loss.item()
             total += loss_v * iq.size(0)
@@ -241,17 +277,21 @@ class MultitaskFinetuner(BaseTrainer):
     resume_name = "finetune_resume.pt"
 
     def __init__(self, cfg, model, device, logger, out_dir, loaders, param_stats,
-                 resume=None, smoke_steps=0):
+                 resume=None, smoke_steps=0, rank=0, world_size=1):
         self.loaders = loaders
         self.param_stats = param_stats
         # tcfg 在 super().__init__ 才就位，此处直接读 training 子配置
         self.weights = cfg["training"].get("task_weights",
                                            {"protocol": 0.3, "modulation": 0.3, "parameter": 0.4})
         self.best, self.bad = -float("inf"), 0  # 须在 super().__init__ 前（resume 依赖）
-        super().__init__(cfg, model, device, logger, out_dir, resume, smoke_steps)
+        super().__init__(cfg, model, device, logger, out_dir, resume, smoke_steps,
+                         rank, world_size)
 
     def n_epochs(self):
         return self.tcfg["epochs_finetune"]
+
+    def _train_loaders(self):
+        return list(self.loaders["train"].values())
 
     def steps_per_epoch(self):
         steps = max(len(self.loaders["train"][t]) for t in TASK_ORDER)
@@ -269,7 +309,8 @@ class MultitaskFinetuner(BaseTrainer):
         losses = {t: 0.0 for t in TASK_ORDER}
         norms = []
         desc = f"finetune epoch {self._epoch + 1}/{self.n_epochs()}"
-        for _ in tqdm(range(n_steps), desc=desc, leave=False, dynamic_ncols=True):
+        for _ in tqdm(range(n_steps), desc=desc, leave=False, dynamic_ncols=True,
+                      disable=not self.is_main):
             for task in TASK_ORDER:
                 batch = next_batch(iters, self.loaders["train"], task)
                 batch = {k: v.to(self.device) for k, v in batch.items()}
@@ -278,7 +319,8 @@ class MultitaskFinetuner(BaseTrainer):
                     loss = TASKS[task].loss(self.model, feat, batch, self.tcfg)
                     loss = loss * float(self.weights[task])
                 grad_norm = optimizer_step(loss, self.optimizer, self.model, self.scaler,
-                                           self.tcfg.get("grad_clip", 1.0))
+                                           self.tcfg.get("grad_clip", 1.0),
+                                           world_size=self.world_size)
                 self.scheduler.step()
                 loss_v = loss.item()
                 losses[task] += loss_v
@@ -293,6 +335,9 @@ class MultitaskFinetuner(BaseTrainer):
         return values
 
     def on_epoch_end(self, epoch):
+        # 多卡时 val 评估只在主卡做（各卡权重同步，主卡结果即全局结果）
+        if not self.is_main:
+            return {}
         if self.smoke_steps or (epoch + 1) % self.tcfg.get("eval_every", 1) != 0:
             return {}
         if any(t not in self.loaders.get("val", {}) for t in TASK_ORDER):
