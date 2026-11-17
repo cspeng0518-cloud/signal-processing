@@ -52,7 +52,9 @@ def build_pretrain_loader(data_dir, cfg, device, logger):
         n_total += len(ds)
         logger.info("pretrain: %s -> %d samples", t, len(ds))
     if not datasets:
-        raise FileNotFoundError(f"no train_*.parquet under {data_dir}")
+        raise FileNotFoundError(
+            f"no training data under {data_dir}; run `python utils/prepare_official.py` "
+            f"first (produces datasets/<task>/iq.memap + meta.json), or check --data_dir")
     return DataLoader(
         UnlabeledIQ(ConcatDataset(datasets)),
         batch_size=cfg["batch_size"], shuffle=True, drop_last=True,

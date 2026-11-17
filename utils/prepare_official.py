@@ -6,14 +6,17 @@
     python utils/prepare_official.py --val_ratio 0.02
 
 处理内容:
-  1. 按行组流式扫描 3 个分块（part_001~003），按 task 列分派样本
-     （大表按行混排，不能按文件假设任务!）
+  1. 按行组流式扫描 3 个分块（part_001~003，自动发现 datasets/ 下的
+     任意深度嵌套布局），按 task 列分派样本（大表按行混排，不能按文件假设任务!）
   2. iq (list<list<float>>) -> float32 memmap [N, 1024, 2]（512 补零对齐）
   3. 每任务产出:
-       datasets_official/{task}/iq.memap       float32 memmap
-       datasets_official/{task}/meta.json      labels/params/valid/patterns/sample_ids/val
-     并写 datasets_official/{split}_{task}.parquet 兼容 build_task_dataloaders
+       datasets/{task}/iq.memap       float32 memmap
+       datasets/{task}/meta.json      labels/params/valid/patterns/sample_ids/val
   4. val 划分: 对 protocol/modulation 按 label 分层抽样；parameter 按 pattern 分层
+
+输出直接写入 datasets/ 本体——make_task_dataset 优先读 memmap，训练命令
+--data_dir datasets 保持不变；旧模拟数据应放在 datasets/simulated/ 子目录，
+避免未预处理时被 Parquet 回退路径静默误用。
 
 统计来源: docs/real_data_stats.json（全量 1,179,000 行扫描结果）
 """
@@ -43,9 +46,9 @@ PARAM_NAMES = [
     "pulse_width", "pri", "time_delay", "number_of_pulses",
 ]
 
-# 官方 3 分块路径（自动发现）
+# 官方 3 分块路径（自动发现，** 允许解压产生的任意深度嵌套）
 CHUNK_GLOBS = [
-    os.path.join(ROOT, "datasets", "*", "rf_signal_benchmark_train_v1.0",
+    os.path.join(ROOT, "datasets", "**", "rf_signal_benchmark_train_v1.0",
                  "*part_*of_003.parquet"),
 ]
 
@@ -53,10 +56,12 @@ SEQ_LEN = 1024  # 官方 iq 长度 512/1024，统一对齐补零到 1024
 
 
 def find_chunks():
-    files = sorted(glob.glob(CHUNK_GLOBS[0]))
+    files = sorted(glob.glob(CHUNK_GLOBS[0], recursive=True))
     if not files:
         raise FileNotFoundError(
-            "未找到官方分块文件，期望 datasets/*/rf_signal_benchmark_train_v1.0/*part_*of_003.parquet")
+            "未找到官方分块文件，期望 datasets/**/rf_signal_benchmark_train_v1.0/*part_*of_003.parquet")
+    if len(files) != 3:
+        raise FileNotFoundError(f"期望 3 个分块，实际发现 {len(files)} 个: {files}")
     return files
 
 
@@ -130,7 +135,7 @@ def to_legacy_parquet(df_task, out_dir, split, task):
 
 
 def run(limit=None, val_ratio=0.02, out_dir=None):
-    out_dir = out_dir or os.path.join(ROOT, "datasets_official")
+    out_dir = out_dir or os.path.join(ROOT, "datasets")
     os.makedirs(out_dir, exist_ok=True)
     chunks = find_chunks()
     print(f"[prepare] chunks: {[os.path.basename(c) for c in chunks]}")
@@ -259,6 +264,6 @@ if __name__ == "__main__":
                     help="跳过重扫官方分块，仅从已有 memmap+meta 重建兼容 parquet")
     args = ap.parse_args()
     if args.only_compat:
-        rebuild_compat(args.out_dir or os.path.join(ROOT, "datasets_official"))
+        rebuild_compat(args.out_dir or os.path.join(ROOT, "datasets"))
     else:
         run(limit=args.limit, val_ratio=args.val_ratio, out_dir=args.out_dir)

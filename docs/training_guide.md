@@ -40,13 +40,18 @@ signal-processing/
 │   │   └── common.py             # shared scaffolding (config normalization / MAE loading)
 │   ├── utils/                    # dataset / logging / checkpointing / metrics
 │   └── infer.py                  # official inference entry
-├── datasets/                     # preprocessed official data (train_*.parquet / val_*.parquet)
+├── datasets/                     # official data: raw chunks (01/02/03, zips extracted)
+│   │                              # + prepared memmap ({task}/iq.memap + meta.json,
+│   │                              #   produced by utils/prepare_official.py)
+│   └── simulated/                 # legacy simulated parquets (fallback only)
 ├── weights/                      # output directory (checkpoints, exported weights)
 └── logs/                         # training metrics (jsonl)
 ```
 
-Dataset naming: `train_protocol.parquet` (new) and `train_system.parquet` (legacy)
-are both accepted with automatic fallback.
+Data loading priority: if `datasets/{task}/meta.json` exists (prepared memmap),
+it is used automatically; otherwise the loader falls back to
+`{split}_{task}.parquet` in the data dir (legacy `train_system.parquet` naming
+is also accepted). Keep `--data_dir datasets` in all commands below.
 
 ---
 
@@ -72,7 +77,29 @@ are both accepted with automatic fallback.
 
 ## 4. Training Workflow
 
-### 4.0 Smoke Test (run this before real training)
+### 4.0 Data Preparation (one-time, before any training)
+
+The raw official chunks live under
+`datasets/01|02|03/rf_signal_benchmark_train_v1.0/` (~2 GB each). Convert them
+into the fast memmap training format first:
+
+```bash
+cd signal-processing
+
+# Smoke-scale conversion (first 3,000 samples per task, minutes)
+python utils/prepare_official.py --limit 3000
+
+# Full conversion (1,179,000 rows -> ~9.7 GB memmap, streaming row-group scan)
+python utils/prepare_official.py
+```
+
+This produces `datasets/{task}/iq.memap + meta.json` with a stratified 2%
+val split (by label / pattern) recorded in `meta.json`. All commands below
+keep `--data_dir datasets` — the loader picks the memmap up automatically
+(highest priority). Chunk discovery handles any extraction nesting depth and
+errors out unless exactly 3 parts are found.
+
+### 4.1 Smoke Test (run this before real training)
 
 ```bash
 cd signal-processing
@@ -87,7 +114,7 @@ python code/training/finetune_multitask.py --data_dir datasets --out_dir weights
 Pass criteria: both scripts exit without errors, checkpoint files appear under
 `weights/`, and the log ends with `recon_mse=...` / `train_*_weighted_loss=...`.
 
-### 4.1 Stage 1: MAE Self-Supervised Pretraining (task-agnostic)
+### 4.2 Stage 1: MAE Self-Supervised Pretraining (task-agnostic)
 
 ```bash
 python code/training/pretrain_mae.py \
@@ -108,7 +135,7 @@ python code/training/pretrain_mae.py --data_dir datasets --out_dir weights \
     --resume weights/mae_resume.pt
 ```
 
-### 4.2 Stage 2: Single-Backbone Multi-Task Finetuning
+### 4.3 Stage 2: Single-Backbone Multi-Task Finetuning
 
 ```bash
 # Automatically loads weights/mae_pretrained.pt as initialization
@@ -135,7 +162,7 @@ python code/training/finetune_multitask.py --data_dir datasets --out_dir weights
     --resume weights/finetune_resume.pt         # resume (keeps weights, skips MAE reload)
 ```
 
-### 4.3 Inference (official format)
+### 4.4 Inference (official format)
 
 ```bash
 python code/infer.py \
@@ -207,8 +234,9 @@ violation:
 
 ## 7. FAQ
 
-1. **Error `no train_*.parquet under ...`**: wrong `--data_dir` path; make sure it
-   points to the directory containing `train_protocol.parquet` and friends.
+1. **Error `no training data under ...`**: run `python utils/prepare_official.py`
+   first (Section 4.0) or check `--data_dir`; official data requires the memmap
+   under `datasets/{task}/`, the parquet fallback only covers simulated data.
 2. **Error about unknown layer type**: `layer_types` only accepts `full_attention` /
    `mla` / `gda` / `mamba` (legacy `attn` is also accepted and normalized).
 3. **Hybrid backbone error asking for `pos_encoding='rope'`**: by design — MLA /

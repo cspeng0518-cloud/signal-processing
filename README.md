@@ -7,12 +7,17 @@
 ```bash
 pip install -r environment/requirements.txt
 python -m pytest tests/test_model_pipeline.py tests/test_infer_outputs.py -q
+python utils/prepare_official.py            # 官方数据 -> memmap（首次必跑，见训练指导 4.0）
 python code/training/pretrain_mae.py --data_dir datasets --out_dir weights
 python code/training/finetune_multitask.py --data_dir datasets --out_dir weights
-python code/infer.py --input datasets/test_modulation.parquet --output out/test_predictions.jsonl
+python code/infer.py \
+    --input datasets/01/rf_signal_sample_io_v1.0/rf_signal_sample_io_input_v1.0.parquet \
+    --output out/test_predictions.jsonl
 ```
 
-现有 `datasets/` 是旧仓库附带的**模拟示例**。正式比赛必须换成赛事真实数据并完整训练，详见 [docs/CHANGELOG_AND_REVIEW.md](docs/CHANGELOG_AND_REVIEW.md)。
+`datasets/01|02|03/` 为官方真实数据分块（共 1,179,000 行），`prepare_official.py`
+将其流式转为 `datasets/{task}/iq.memap + meta.json`（含 2% 分层 val 划分）。
+旧模拟数据已移至 `datasets/simulated/`（仅在无 memmap 时回退使用）。
 
 `code/configs/default.json` 控制结构和训练；训练参数设定为建议起点，不是调参最优值。仅调试时可给两阶段脚本加 `--smoke_steps 1`。训练恢复使用 `--resume weights/mae_resume.pt` 或 `--resume weights/finetune_resume.pt`。
 
