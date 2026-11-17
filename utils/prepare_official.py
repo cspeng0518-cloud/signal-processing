@@ -3,7 +3,7 @@
 用法:
     python utils/prepare_official.py                    # 全量 1,179,000 行
     python utils/prepare_official.py --limit 3000       # 冒烟测试: 每任务前 N 行
-    python utils/prepare_official.py --val_ratio 0.02
+    python utils/prepare_official.py --val_ratio 0.10 --test_ratio 0.10
 
 处理内容:
   1. 按行组流式扫描 3 个分块（part_001~003，自动发现 datasets/ 下的
@@ -11,8 +11,10 @@
   2. iq (list<list<float>>) -> float32 memmap [N, 1024, 2]（512 补零对齐）
   3. 每任务产出:
        datasets/{task}/iq.memap       float32 memmap
-       datasets/{task}/meta.json      labels/params/valid/patterns/sample_ids/val
-  4. val 划分: 对 protocol/modulation 按 label 分层抽样；parameter 按 pattern 分层
+       datasets/{task}/meta.json      labels/params/valid/patterns/sample_ids/val/test
+  4. 划分: train/val/test 三分（默认 80%/10%/10%），对 protocol/modulation 按 label
+     分层抽样，parameter 按 pattern 分层。val 参与早停与导出决策，test 从不参与
+     任何训练期决策——仅供训练结束后无偏评估（finetune --eval_test）
 
 输出直接写入 datasets/ 本体——make_task_dataset 优先读 memmap，训练命令
 --data_dir datasets 保持不变；旧模拟数据应放在 datasets/simulated/ 子目录，
@@ -60,6 +62,14 @@ def find_chunks():
     if not files:
         raise FileNotFoundError(
             "未找到官方分块文件，期望 datasets/**/rf_signal_benchmark_train_v1.0/*part_*of_003.parquet")
+    # 同名分块出现在多个目录（重复解压/重复上传）会导致同一数据被写两遍，
+    # 必须在文件名层面去重校验（曾出现 part_002 两份 + part_001 缺失的静默事故）
+    names = [os.path.basename(f) for f in files]
+    dup = sorted({n for n in names if names.count(n) > 1})
+    if dup:
+        raise FileNotFoundError(
+            f"发现重复分块文件 {dup}（同一 part 多份，多为重复解压/上传），"
+            f"请清理至每个 part 仅一份后重试。当前文件: {files}")
     if len(files) != 3:
         raise FileNotFoundError(f"期望 3 个分块，实际发现 {len(files)} 个: {files}")
     return files
@@ -97,10 +107,11 @@ class TaskWriter:
             self.meta["valid"].append(valid)
             self.meta["patterns"].append(pattern)
 
-    def finalize(self, val_ids):
+    def finalize(self, val_ids, test_ids=()):
         self._fh.close()
         assert self.n_written == len(self.meta["sample_ids"])
         self.meta["val_sample_ids"] = sorted(val_ids)
+        self.meta["test_sample_ids"] = sorted(test_ids)
         with open(os.path.join(self.dir, "meta.json"), "w", encoding="utf-8") as f:
             json.dump(self.meta, f)
         # 校验 memmap 可读回
@@ -110,21 +121,24 @@ class TaskWriter:
         return self.n_written
 
 
-def stratified_val_split(meta, ratio, seed=2023):
-    """分层抽样 val sample_id 集合：protocol/modulation 按 label，parameter 按 pattern"""
+def stratified_split(meta, val_ratio, test_ratio, seed=2023):
+    """分层抽样切分 (val_ids, test_ids)：protocol/modulation 按 label，
+    parameter 按 pattern。每层先抽 val 再抽 test，两者互斥。"""
     rng = np.random.default_rng(seed)
     ids = meta["sample_ids"]
     if "labels" in meta and meta["labels"]:
         strata = meta["labels"]
     else:
         strata = meta["patterns"]
-    val_ids = set()
+    val_ids, test_ids = set(), set()
     for lab in sorted(set(strata)):
         idx = [i for i, s in enumerate(strata) if s == lab]
         rng.shuffle(idx)
-        k = max(int(len(idx) * ratio), 1)
-        val_ids.update(ids[i] for i in idx[:k])
-    return val_ids
+        k_val = max(int(len(idx) * val_ratio), 1)
+        k_test = max(int(len(idx) * test_ratio), 1)
+        val_ids.update(ids[i] for i in idx[:k_val])
+        test_ids.update(ids[i] for i in idx[k_val:k_val + k_test])
+    return val_ids, test_ids
 
 
 def to_legacy_parquet(df_task, out_dir, split, task):
@@ -134,7 +148,7 @@ def to_legacy_parquet(df_task, out_dir, split, task):
     return path
 
 
-def run(limit=None, val_ratio=0.02, out_dir=None):
+def run(limit=None, val_ratio=0.10, test_ratio=0.10, out_dir=None):
     out_dir = out_dir or os.path.join(ROOT, "datasets")
     os.makedirs(out_dir, exist_ok=True)
     chunks = find_chunks()
@@ -161,13 +175,16 @@ def run(limit=None, val_ratio=0.02, out_dir=None):
         if limit is not None and all(counts[t] >= limit for t in counts):
             break
 
-    # val 划分 + 落盘
-    val_ids = {}
+    # 划分（val/test 分层互斥）+ 落盘
+    val_ids, test_ids = {}, {}
     for task, w in writers.items():
-        val_ids[task] = stratified_val_split(w.meta, val_ratio) if w.n_written > 0 else set()
-        n = w.finalize(val_ids[task])
+        if w.n_written > 0:
+            val_ids[task], test_ids[task] = stratified_split(w.meta, val_ratio, test_ratio)
+        else:
+            val_ids[task], test_ids[task] = set(), set()
+        n = w.finalize(val_ids[task], test_ids[task])
         print(f"[prepare] {task}: {n} samples "
-              f"(val={len(val_ids[task])}) -> {w.dir}")
+              f"(val={len(val_ids[task])}, test={len(test_ids[task])}) -> {w.dir}")
 
     # ---- 兼容布局 Parquet（仅冒烟/小规模；全量训练直接走 memmap 更省内存）----
     summary = {}
@@ -178,8 +195,10 @@ def run(limit=None, val_ratio=0.02, out_dir=None):
             if n == 0:
                 continue
             is_val = np.array([s in val_ids[task] for s in m["sample_ids"]])
+            is_test = np.array([s in test_ids[task] for s in m["sample_ids"]])
             mm = np.memmap(w.iq_path, dtype=np.float32, mode="r", shape=(n, SEQ_LEN, 2))
-            for split, keep in (("train", ~is_val), ("val", is_val)):
+            for split, keep in (("train", ~(is_val | is_test)), ("val", is_val),
+                                ("test", is_test)):
                 df = build_compat_df(task, m, mm, np.where(keep)[0])
                 to_legacy_parquet(df, out_dir, split, task)
                 summary[f"{split}_{task}"] = len(df)
@@ -189,8 +208,8 @@ def run(limit=None, val_ratio=0.02, out_dir=None):
               "(train/val read memmap directly via make_task_dataset)")
 
     with open(os.path.join(out_dir, "prepare_summary.json"), "w", encoding="utf-8") as f:
-        json.dump({"counts": counts, "val_ratio": val_ratio, "seq_len": SEQ_LEN,
-                   "splits": summary}, f, indent=2)
+        json.dump({"counts": counts, "val_ratio": val_ratio, "test_ratio": test_ratio,
+                   "seq_len": SEQ_LEN, "splits": summary}, f, indent=2)
     print("[prepare] done ->", os.path.join(out_dir, "prepare_summary.json"))
 
 
@@ -236,10 +255,13 @@ def rebuild_compat(out_dir, per_shard=50000):
             meta = json.load(f)
         n = len(meta["sample_ids"])
         val_ids = set(meta.get("val_sample_ids", []))
+        test_ids = set(meta.get("test_sample_ids", []))
         is_val = np.array([s in val_ids for s in meta["sample_ids"]])
+        is_test = np.array([s in test_ids for s in meta["sample_ids"]])
         mm = np.memmap(os.path.join(d, "iq.memap"), dtype=np.float32, mode="r",
                        shape=(n, meta["seq_len"], 2))
-        for split, keep in (("train", ~is_val), ("val", is_val)):
+        for split, keep in (("train", ~(is_val | is_test)), ("val", is_val),
+                            ("test", is_test)):
             idx_all = np.where(keep)[0]
             total = 0
             for si in range(0, len(idx_all), per_shard):
@@ -258,7 +280,9 @@ def rebuild_compat(out_dir, per_shard=50000):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--limit", type=int, default=None, help="每任务最多处理行数（冒烟用）")
-    ap.add_argument("--val_ratio", type=float, default=0.02)
+    ap.add_argument("--val_ratio", type=float, default=0.10)
+    ap.add_argument("--test_ratio", type=float, default=0.10,
+                    help="test 划分比例（不参与任何训练期决策，仅供无偏评估）")
     ap.add_argument("--out_dir", default=None)
     ap.add_argument("--only_compat", action="store_true",
                     help="跳过重扫官方分块，仅从已有 memmap+meta 重建兼容 parquet")
@@ -266,4 +290,5 @@ if __name__ == "__main__":
     if args.only_compat:
         rebuild_compat(args.out_dir or os.path.join(ROOT, "datasets"))
     else:
-        run(limit=args.limit, val_ratio=args.val_ratio, out_dir=args.out_dir)
+        run(limit=args.limit, val_ratio=args.val_ratio, test_ratio=args.test_ratio,
+            out_dir=args.out_dir)

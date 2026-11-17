@@ -93,11 +93,16 @@ python utils/prepare_official.py --limit 3000
 python utils/prepare_official.py
 ```
 
-This produces `datasets/{task}/iq.memap + meta.json` with a stratified 2%
-val split (by label / pattern) recorded in `meta.json`. All commands below
+This produces `datasets/{task}/iq.memap + meta.json` with a stratified three-way
+split recorded in `meta.json`: **train/val/test = 80%/10%/10%** (stratified by
+label for protocol/modulation, by comm/radar pattern for parameter). The val
+split drives early stopping and best-weight export; the test split never
+participates in any training-time decision and is only used for the unbiased
+post-training evaluation (`--eval_test`, Section 4.3). All commands below
 keep `--data_dir datasets` — the loader picks the memmap up automatically
-(highest priority). Chunk discovery handles any extraction nesting depth and
-errors out unless exactly 3 parts are found.
+(highest priority). Chunk discovery handles any extraction nesting depth,
+rejects duplicated part files (same part extracted/uploaded twice), and
+errors out unless exactly 3 distinct parts are found.
 
 ### 4.1 Smoke Test (run this before real training)
 
@@ -160,6 +165,10 @@ python code/training/finetune_multitask.py --data_dir datasets --out_dir weights
     --from_mae weights/mae_pretrained.pt        # use a specific pretrained checkpoint
 python code/training/finetune_multitask.py --data_dir datasets --out_dir weights \
     --resume weights/finetune_resume.pt         # resume (keeps weights, skips MAE reload)
+python code/training/finetune_multitask.py --data_dir datasets --out_dir weights \
+    --eval_test                                 # after fit(): unbiased eval on the
+                                                # test split (loads exported best
+                                                # weights; run it ONCE per model)
 ```
 
 ### 4.4 Inference (official format)

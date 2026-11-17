@@ -174,7 +174,8 @@ class PreparedOfficialDataset(Dataset):
     目录结构:
       data_dir/{task}/iq.memap   —— float32 [total, seq_len, 2]（每个样本对齐到 seq_len）
       data_dir/{task}/meta.json  —— {"seq_len": N, "labels": [...], "params": [[...]],
-                                     "valid": [[...]], "patterns": [...], "sample_ids": [...]}
+                                     "valid": [[...]], "patterns": [...], "sample_ids": [...],
+                                     "val_sample_ids": [...], "test_sample_ids": [...]}
     """
 
     def __init__(self, data_dir, task, seq_len=1024, param_stats=None):
@@ -222,8 +223,8 @@ def make_task_dataset(data_dir, task, split="train", seq_len=1024, param_stats=N
     """统一工厂：优先用预处理 memmap（官方数据），否则退回 Parquet。
 
     data_dir 布局二选一:
-      官方预处理: {task}/iq.memap + {task}/meta.json（val 划分记录在 meta 的
-                  val_sample_ids，train/val 均从同一 memmap 过滤）
+      官方预处理: {task}/iq.memap + {task}/meta.json（val/test 划分记录在 meta 的
+                  val_sample_ids / test_sample_ids，train/val/test 均从同一 memmap 过滤）
       模拟数据:   {split}_{task}.parquet（data_gen.py 产出）
     """
     mm_dir = os.path.join(data_dir, task)
@@ -231,10 +232,19 @@ def make_task_dataset(data_dir, task, split="train", seq_len=1024, param_stats=N
     if has_mm:
         full = PreparedOfficialDataset(data_dir, task, seq_len, param_stats)
         val_ids = set(full.meta.get("val_sample_ids", []))
+        test_ids = set(full.meta.get("test_sample_ids", []))
         if split == "val" and not val_ids:
             raise FileNotFoundError(f"{task} has no val split in meta")
-        keep = [i for i, s in enumerate(full.meta["sample_ids"])
-                if (s in val_ids) == (split == "val")]
+        if split == "test" and not test_ids:
+            raise FileNotFoundError(
+                f"{task} has no test split in meta; re-run utils/prepare_official.py "
+                "(a recent version writes test_sample_ids)")
+        if split == "test":
+            keep = [i for i, s in enumerate(full.meta["sample_ids"]) if s in test_ids]
+        else:
+            # train = 全量减 val 减 test；val = val 集合（test 与 val 互斥）
+            keep = [i for i, s in enumerate(full.meta["sample_ids"])
+                    if (s in val_ids) == (split == "val") and s not in test_ids]
         return torch.utils.data.Subset(full, keep)
     pq_path = os.path.join(data_dir, f"{split}_{task}.parquet")
     if os.path.exists(pq_path):
@@ -286,8 +296,9 @@ def build_task_dataloaders(data_dir, batch_size=32, seq_len=1024, splits=("train
                            tasks=("protocol", "modulation", "parameter"), num_workers=0):
     """构建多任务 DataLoader 字典
 
-    优先使用预处理 memmap 布局（{task}/iq.memap + meta.json，val 划分在 meta 内），
+    优先使用预处理 memmap 布局（{task}/iq.memap + meta.json，val/test 划分在 meta 内），
     否则退回 Parquet 布局（{split}_{task}.parquet，模拟数据 data_gen.py 产出）。
+    splits 可含 "test"（仅供训练后无偏评估，见 finetune_multitask.py --eval_test）。
 
     Returns:
         loaders = {
