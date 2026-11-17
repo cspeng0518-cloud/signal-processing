@@ -20,7 +20,8 @@ from training.common import ROOT
 from training.tasks import TASKS, TASK_ORDER
 from utils.checkpoint import load_checkpoint, save_checkpoint
 from utils.dataset import save_param_stats
-from utils.logger import plot_metrics, plot_step_metrics, record_metrics, record_step
+from utils.logger import (plot_metrics, plot_step_metrics, record_metrics,
+                          record_step, reset_metrics)
 from utils.train_utils import autocast_context, broadcast_flag, build_scheduler, \
     optimizer_step, tqdm
 
@@ -162,6 +163,9 @@ class BaseTrainer(ABC):
 
     # ---------------- 生命周期 ----------------
     def fit(self):
+        # 从头训练时刷新指标 jsonl（新运行覆盖旧记录）；断点续训保留历史继续追加
+        if self.is_main and self.start_epoch == 0:
+            reset_metrics(ROOT / "logs", self.tag)
         try:
             for epoch in range(self.start_epoch, self.n_epochs()):
                 self._epoch = epoch

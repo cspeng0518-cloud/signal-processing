@@ -42,6 +42,32 @@ def record_step(log_dir, stage, step, epoch, metrics):
         f.write(json.dumps(obj, ensure_ascii=False, allow_nan=False) + "\n")
 
 
+def reset_metrics(log_dir, stage):
+    """新运行开始时清空该阶段的 jsonl（刷新而非追加）。
+
+    训练脚本在"从头训练"时调用；断点续训不调用（保留历史继续追加，
+    曲线延续同一次运行）。
+    """
+    for name in (f"{stage}_metrics.jsonl", f"{stage}_steps.jsonl"):
+        path = Path(log_dir) / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("", encoding="utf-8")
+
+
+def _last_run(records, key):
+    """取追加写 jsonl 中最近一次运行的数据。
+
+    单次运行内 key（epoch 或 step）严格递增；新一次运行从开头重新编号，
+    必然出现 value <= 前一行，以此为分界。不能用 "epoch==1" 判定运行起点：
+    冒烟模式只有 1 个 epoch，每行都是 epoch=1，会误截断到最后一行。
+    """
+    start = 0
+    for i in range(1, len(records)):
+        if records[i].get(key, 0) <= records[i - 1].get(key, 0):
+            start = i
+    return records[start:]
+
+
 def plot_metrics(jsonl_path, out_dir, stage):
     """训练结束后从 jsonl 指标自动绘制曲线图，保存为 out_dir/<stage>_<group>.png。
 
@@ -60,11 +86,9 @@ def plot_metrics(jsonl_path, out_dir, stage):
                Path(jsonl_path).read_text(encoding="utf-8").splitlines() if line.strip()]
     if not records:
         return []
-    # jsonl 追加写会累积多次运行，只取最近一次（从最后一个 epoch==1 截断；
+    # jsonl 追加写会累积多次运行，只取最近一次（key 回退检测，见 _last_run；
     # 断点续训的 epoch 延续编号，会完整保留在同一 run 内）
-    starts = [i for i, r in enumerate(records) if r.get("epoch") == 1]
-    if starts:
-        records = records[starts[-1]:]
+    records = _last_run(records, "epoch")
     epochs = [r.get("epoch", i + 1) for i, r in enumerate(records)]
 
     def group_of(key):
@@ -126,9 +150,8 @@ def plot_step_metrics(jsonl_path, out_dir, stage, epoch_jsonl_path=None):
     if not records:
         return []
     # 与 plot_metrics 相同：jsonl 追加写累积多次运行，只取最近一次
-    starts = [i for i, r in enumerate(records) if r.get("epoch") == 1]
-    if starts:
-        records = records[starts[-1]:]
+    # （step 回退检测——冒烟等单 epoch 运行里每行 epoch 都相同，不能用 epoch==1 判定）
+    records = _last_run(records, "step")
 
     # epoch 分界（step, epoch 列表，遇到 epoch 变化即一条边界）
     boundaries, last_epoch = [], None
@@ -144,9 +167,7 @@ def plot_step_metrics(jsonl_path, out_dir, stage, epoch_jsonl_path=None):
         erecs = [json.loads(line) for line in
                  Path(epoch_jsonl_path).read_text(encoding="utf-8").splitlines()
                  if line.strip()]
-        estarts = [i for i, r in enumerate(erecs) if r.get("epoch") == 1]
-        if estarts:
-            erecs = erecs[estarts[-1]:]
+        erecs = _last_run(erecs, "epoch")
         epoch_last_step = {}
         for r in records:
             epoch_last_step[r["epoch"]] = r["step"]
@@ -183,7 +204,8 @@ def plot_step_metrics(jsonl_path, out_dir, stage, epoch_jsonl_path=None):
         fig, ax = plt.subplots(figsize=(10, 5))
         for k, pts in series.items():
             xs, ys = zip(*pts)
-            ax.plot(xs, ys, linewidth=0.8, label=k)
+            # marker：单个/稀疏数据点也可见（折线在 1 个点时不可见）
+            ax.plot(xs, ys, linewidth=0.8, marker=".", markersize=3, label=k)
         # val 指标仅在 loss 图叠加（右副轴，"x" 标记），避免污染 grad_norm/lr 图
         ax2 = None
         if name == "loss" and val_series:
