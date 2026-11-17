@@ -208,14 +208,18 @@ input row order; parameter samples are hard-masked by the pattern head
 # 2) Per-epoch jsonl metrics (one line per epoch)
 tail -f logs/pretrain_metrics.jsonl    # recon_mse / grad_norm / lr
 tail -f logs/finetune_metrics.jsonl    # train_*_loss / val_* / val_proxy_score
+tail -f logs/pretrain_steps.jsonl      # per-step records (step / epoch / loss ...)
 
 # 3) TensorBoard curves (step-level loss / grad norm / lr + epoch-level val metrics)
 tensorboard --logdir logs/tb --port 6006
 # open http://<training-machine-IP>:6006 in a browser
 
 # 4) Automatic plots after training finishes: PNGs under logs/plots/
-#    (grouped by loss / grad_norm / lr / val), generated automatically
-#    when fit() ends — no manual command needed
+#    - <stage>_<group>.png       per-epoch curves (loss / grad_norm / lr / val)
+#    - <stage>_step_<group>.png  per-step curves, ALL epochs on one figure,
+#      with dashed vertical lines marking epoch boundaries; the loss figure
+#      also overlays val metrics ("x" markers on a secondary right axis,
+#      placed at each epoch's last step) so train and val share one chart
 ls logs/plots/
 ```
 

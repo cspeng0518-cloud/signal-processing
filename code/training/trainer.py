@@ -20,7 +20,7 @@ from training.common import ROOT
 from training.tasks import TASKS, TASK_ORDER
 from utils.checkpoint import load_checkpoint, save_checkpoint
 from utils.dataset import save_param_stats
-from utils.logger import plot_metrics, record_metrics
+from utils.logger import plot_metrics, plot_step_metrics, record_metrics, record_step
 from utils.train_utils import autocast_context, build_scheduler, optimizer_step, tqdm
 
 
@@ -123,9 +123,11 @@ class BaseTrainer(ABC):
 
     # ---------------- 可视化 ----------------
     def _log_scalars(self, values):
-        """step 级指标写 TensorBoard（train/loss、train/grad_norm、train/lr）。"""
+        """step 级指标写 TensorBoard + step jsonl（含 epoch，供 step 级出图）。"""
         for k, v in values.items():
             self.writer.add_scalar(k, v, self.global_step)
+        record_step(ROOT / "logs", self.tag, self.global_step,
+                    self._epoch + 1, values)
 
     def _log_epoch(self, values, epoch):
         """epoch 级指标写 TensorBoard（epoch/ 前缀；jsonl 由 record_metrics 落盘）。"""
@@ -157,10 +159,16 @@ class BaseTrainer(ABC):
                     break
         finally:
             self.writer.close()
-        # 训练结束后自动绘制指标曲线图（logs/plots/<tag>_<group>.png）
+        # 训练结束后自动绘制指标曲线图
+        # epoch 级：logs/plots/<tag>_<group>.png；step 级（含 epoch 分界标注）：
+        # logs/plots/<tag>_step_<group>.png
         for png in plot_metrics(ROOT / "logs" / f"{self.tag}_metrics.jsonl",
                                 ROOT / "logs" / "plots", self.tag):
             self.logger.info("plot saved: %s", png)
+        for png in plot_step_metrics(ROOT / "logs" / f"{self.tag}_steps.jsonl",
+                                     ROOT / "logs" / "plots", self.tag,
+                                     ROOT / "logs" / f"{self.tag}_metrics.jsonl"):
+            self.logger.info("step plot saved: %s", png)
         self.on_finish()
 
 
