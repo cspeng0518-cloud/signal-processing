@@ -317,7 +317,9 @@ class MultitaskFinetuner(BaseTrainer):
                       disable=not self.is_main):
             for task in TASK_ORDER:
                 batch = next_batch(iters, self.loaders["train"], task)
-                batch = {k: v.to(self.device) for k, v in batch.items()}
+                # task/sample_id 等字符串字段 collate 后是 list，只搬移 tensor
+                batch = {k: (v.to(self.device) if torch.is_tensor(v) else v)
+                         for k, v in batch.items()}
                 with autocast_context(self.device, self.tcfg.get("amp", True)):
                     feat = self.model.encode(batch["iq"], batch["sr"])
                     loss = TASKS[task].loss(self.model, feat, batch, self.tcfg)
