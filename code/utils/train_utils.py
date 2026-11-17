@@ -12,6 +12,8 @@ def seed_all(seed=42):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+    if hasattr(torch, "npu") and torch.npu.is_available():
+        torch.npu.manual_seed_all(seed)
 
 
 def get_device():
