@@ -35,14 +35,14 @@ def export_pretrained(model, out_dir):
 
 
 def export_model(model, cfg, param_stats, out_dir):
-    """导出官方推理格式（config.json + model.safetensors + param_stats.npz）。"""
+    """导出官方推理格式（config.json + model.safetensors + param_stats.json）。"""
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "config.json").write_text(
         json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
     save_file({k: v.contiguous().clone() for k, v in model.state_dict().items()},
               str(out_dir / "model.safetensors"))
-    save_param_stats(param_stats, out_dir)
+    save_param_stats(param_stats, out_dir / "param_stats.json")
 
 
 # ================================================================ 基类
