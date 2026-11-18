@@ -73,11 +73,14 @@ class ParameterTask(BaseTaskModule):
         return reg + cfg.get("pattern_loss_weight", 0.3) * aux
 
     def evaluate(self, model, loader, device, param_stats, ref_scale):
+        """指标在归一化 [0,1] 空间计算：ref_scale=0.5 是归一化空间的参考尺度，
+        若先用 SI 单位反归一化再算 precision，rmse 会比 ref_scale 大数百倍，
+        指标对任何非完美模型都趋近 0（SI 空间 rmse≈175 -> precision≈0.003）。
+        官方提交仍由 infer.py 输出 SI 原始单位，此处仅作模型选择监控。"""
         gt, pred, valid = [], [], []
         for batch, out in self._iter_outputs(model, loader, "parameter", device):
-            mn, mx = param_stats["min"], param_stats["max"]
-            pred.append(out.float().cpu().numpy() * (mx - mn) + mn)
-            gt.append(batch["params"].numpy() * (mx - mn) + mn)
+            pred.append(out.float().cpu().numpy())
+            gt.append(batch["params"].numpy())
             valid.append(batch["valid"].numpy())
         y, p = np.concatenate(gt), np.concatenate(pred)
         v = np.concatenate(valid)

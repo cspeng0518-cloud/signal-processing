@@ -79,15 +79,19 @@ def broadcast_flag(flag, device, world_size):
 def all_reduce_mean(metrics, count, device, world_size):
     """多卡分片评估的指标汇总：按各卡样本数加权平均。
 
-    - acc / precision 等比率指标：加权平均与全量统计严格一致
-    - rmse：在平方域合并（加权平均 rmse² 再开方），保证可精确还原全量 rmse
+    - acc / precision 等比率指标：必须按 Σ(metric_r × n_r) / Σn_r 加权合并，
+      比率直接相加再除总数会把指标缩小 world/total 倍（16 卡 val acc 曾因此
+      从 0.94 被错误汇总成 0.001）
+    - rmse：在平方域加权合并（Σ(rmse_r² × n_r) / Σn_r 再开方），可精确还原全量 rmse
     - macro_recall：分片近似（strided 分片类别分布均匀，误差可忽略，仅监控用）
     all-reduce 的归约结果在各卡完全一致，best/早停等决策各卡独立计算也不分歧。
     """
     if world_size < 2:
         return metrics
     keys = sorted(metrics)
-    vals = [metrics[k] * metrics[k] if k == "rmse" else metrics[k] for k in keys]
+    # count 为本卡分片样本数：比率先乘本卡样本数转为"可加量"，归约后再除总数
+    vals = [metrics[k] * metrics[k] * count if k == "rmse"
+            else metrics[k] * count for k in keys]
     t = torch.tensor(vals + [float(count)], dtype=torch.float32, device=device)
     dist.all_reduce(t)
     total = max(1.0, t[-1].item())
