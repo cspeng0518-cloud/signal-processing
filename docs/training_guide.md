@@ -143,9 +143,12 @@ How multi-card training works here:
   across cards after every step (manual all-reduce, no DDP wrapper — the model
   has multiple custom forward entries and MAE leaves task heads unused)
 - All ranks use the same seed, so weights stay bit-identical across cards
-- Only rank 0 writes logs / TensorBoard / checkpoints / exports; validation and
-  the early-stopping decision run on rank 0 and the stop flag is broadcast so
-  every rank exits in step
+- Only rank 0 writes logs / TensorBoard / checkpoints / exports; the validation
+  set is **sharded across all ranks** (each card evaluates its slice in
+  parallel, metrics are all-reduced with sample-count weighting — exact for
+  accuracy/precision), so epoch-end evaluation stays fast and symmetric even
+  on 16 cards. The early-stopping decision is identical on every rank and the
+  stop flag is broadcast so every rank exits in step
 
 ### 4.2 Stage 1: MAE Self-Supervised Pretraining (task-agnostic)
 

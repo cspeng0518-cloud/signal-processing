@@ -76,6 +76,26 @@ def broadcast_flag(flag, device, world_size):
     return bool(t.item())
 
 
+def all_reduce_mean(metrics, count, device, world_size):
+    """多卡分片评估的指标汇总：按各卡样本数加权平均。
+
+    - acc / precision 等比率指标：加权平均与全量统计严格一致
+    - rmse：在平方域合并（加权平均 rmse² 再开方），保证可精确还原全量 rmse
+    - macro_recall：分片近似（strided 分片类别分布均匀，误差可忽略，仅监控用）
+    all-reduce 的归约结果在各卡完全一致，best/早停等决策各卡独立计算也不分歧。
+    """
+    if world_size < 2:
+        return metrics
+    keys = sorted(metrics)
+    vals = [metrics[k] * metrics[k] if k == "rmse" else metrics[k] for k in keys]
+    t = torch.tensor(vals + [float(count)], dtype=torch.float32, device=device)
+    dist.all_reduce(t)
+    total = max(1.0, t[-1].item())
+    return {k: (math.sqrt(t[i].item() / total) if k == "rmse"
+                else t[i].item() / total)
+            for i, k in enumerate(keys)}
+
+
 def autocast_context(device, enabled=True):
     """bf16 混合精度 autocast（预训练后量化友好，无 CUDA 专有算子）。
 

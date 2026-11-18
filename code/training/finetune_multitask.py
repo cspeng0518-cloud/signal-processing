@@ -81,7 +81,7 @@ def main():
         device = get_device()
     logger = get_logger("finetune", ROOT / "logs", quiet=not is_main)
 
-    # ---- 数据（多卡时 train 划分 DistributedSampler 分片，val/test 不分片） ----
+    # ---- 数据（多卡时 train/val 均分片：train 训练、val 并行评估汇总；test 仅主卡） ----
     loaders, param_stats = build_task_dataloaders(
         args.data_dir, batch_size=train_cfg["batch_size"], seq_len=train_cfg["seq_len"],
         num_workers=train_cfg.get("num_workers", 0), rank=rank, world_size=world_size)

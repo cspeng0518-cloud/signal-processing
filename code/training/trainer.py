@@ -22,8 +22,8 @@ from utils.checkpoint import load_checkpoint, save_checkpoint
 from utils.dataset import save_param_stats
 from utils.logger import (plot_metrics, plot_step_metrics, record_metrics,
                           record_step, reset_metrics)
-from utils.train_utils import autocast_context, broadcast_flag, build_scheduler, \
-    optimizer_step, tqdm
+from utils.train_utils import all_reduce_mean, autocast_context, broadcast_flag, \
+    build_scheduler, optimizer_step, tqdm
 
 
 # ================================================================ 导出
@@ -184,8 +184,9 @@ class BaseTrainer(ABC):
                                     **self.checkpoint_extra())
                 if self.smoke_steps:
                     break
-                # 早停由主卡判定（val 评估只在主卡做），广播保证各卡同步退出
-                stop = self.should_stop() if self.is_main else False
+                # 早停判定：val 指标经 all-reduce 后各卡一致，各卡独立判定结果相同；
+                # 广播兜底保证各卡 epoch 循环步调严格一致（主卡写断点略慢）
+                stop = self.should_stop()
                 if broadcast_flag(stop, self.device, self.world_size):
                     self.logger.info("early stopping at epoch %d", epoch + 1)
                     break
@@ -341,26 +342,32 @@ class MultitaskFinetuner(BaseTrainer):
         return values
 
     def on_epoch_end(self, epoch):
-        # 多卡时 val 评估只在主卡做（各卡权重同步，主卡结果即全局结果）
-        if not self.is_main:
-            return {}
+        # 多卡时 val 分片并行评估（各卡权重同步，分片结果等价），指标 all-reduce
+        # 汇总——若只有主卡独自评估全量 val（~5 分钟），其余卡会在早停广播上
+        # 空等导致 HCCL 链路超时（EI0006），分片后评估秒级完成且各卡同时到达广播
         if self.smoke_steps or (epoch + 1) % self.tcfg.get("eval_every", 1) != 0:
             return {}
         if any(t not in self.loaders.get("val", {}) for t in TASK_ORDER):
             raise RuntimeError("missing validation split for one or more tasks")
-        results = {t: TASKS[t].evaluate(self.model, self.loaders["val"][t],
-                                        self.device, self.param_stats,
-                                        self.tcfg.get("ref_scale", 0.5))
-                   for t in TASK_ORDER}
+        results = {}
+        for t in TASK_ORDER:
+            loader = self.loaders["val"][t]
+            m = TASKS[t].evaluate(self.model, loader, self.device,
+                                  self.param_stats, self.tcfg.get("ref_scale", 0.5))
+            # len(sampler) = 本卡分片样本数（多卡）/ 全量（单卡 SequentialSampler）
+            results[t] = all_reduce_mean(m, len(loader.sampler),
+                                         self.device, self.world_size)
         values = {f"val_{t}_{k}": v for t, m in results.items() for k, v in m.items()}
         score = (0.3 * results["protocol"]["acc"]
                  + 0.3 * results["modulation"]["acc"]
                  + 0.4 * results["parameter"]["precision"])
         values["val_proxy_score"] = score
+        # best/bad 各卡一致更新（all-reduce 结果比特级一致）；导出与日志仅主卡
         if score > self.best:
             self.best, self.bad = score, 0
-            export_model(self.model, self.cfg, self.param_stats, self.out_dir)
-            self.logger.info("new best proxy score=%.5f", self.best)
+            if self.is_main:
+                export_model(self.model, self.cfg, self.param_stats, self.out_dir)
+                self.logger.info("new best proxy score=%.5f", self.best)
         else:
             self.bad += 1
         return values

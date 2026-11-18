@@ -302,8 +302,9 @@ def build_task_dataloaders(data_dir, batch_size=32, seq_len=1024, splits=("train
     否则退回 Parquet 布局（{split}_{task}.parquet，模拟数据 data_gen.py 产出）。
     splits 可含 "test"（仅供训练后无偏评估，见 finetune_multitask.py --eval_test）。
 
-    多卡（world_size > 1）时 train 划分用 DistributedSampler 分片（batch_size
-    为单卡批量，总批量 = batch_size × world_size）；val/test 不分片，仅主卡评估。
+    多卡（world_size > 1）时 train/val 划分均用 DistributedSampler 分片（batch_size
+    为单卡批量，总批量 = batch_size × world_size）：train 分片训练，val 分片并行
+    评估后 all-reduce 汇总指标；test 不分片（仅主卡训练后无偏评估用）。
 
     Returns:
         loaders = {
@@ -326,9 +327,13 @@ def build_task_dataloaders(data_dir, batch_size=32, seq_len=1024, splits=("train
                                        param_stats=param_stats if task == "parameter" else None)
             except FileNotFoundError:
                 continue
-            if split == "train" and world_size > 1:
+            if world_size > 1:
+                # train 打乱分片训练；val 跨卡分片并行评估（不打乱、strided 均匀），
+                # 指标在 trainer 侧 all-reduce 汇总，避免主卡独自评估全量 val
+                # 耗时过长、其余卡在集合通信上空等导致 HCCL 链路超时
                 sampler = DistributedSampler(
-                    ds, num_replicas=world_size, rank=rank, shuffle=True)
+                    ds, num_replicas=world_size, rank=rank,
+                    shuffle=(split == "train"))
                 loaders[split][task] = DataLoader(
                     ds, batch_size=batch_size, sampler=sampler,
                     collate_fn=collate_fn, num_workers=num_workers)
