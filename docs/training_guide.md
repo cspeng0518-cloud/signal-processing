@@ -163,6 +163,10 @@ python code/training/pretrain_mae.py \
 - A rolling checkpoint is **overwritten** to `weights/mae_resume.pt` at the end of
   every epoch (a single file, not one per epoch)
 - Shared weights are exported once at the end to `weights/mae_pretrained.pt`
+- Epoch cap `epochs_pretrain` (default 200); no validation split exists for MAE,
+  so early stopping tracks the **training loss** (`recon_mse`): after
+  `patience_pretrain` (default 20) epochs without a new low, training stops
+  (counter round-trips through the resume checkpoint)
 
 **Resume from interruption**:
 
@@ -187,7 +191,8 @@ python code/training/finetune_multitask.py \
 - Whenever the score reaches a new best, official inference artifacts are exported
   to `weights/`: `model.safetensors` + `config.json` + `param_stats.json`
   (again a single rolling best — not one file per epoch)
-- Early stopping: stops after `patience` (default 7) epochs without improvement
+- Epoch cap `epochs_finetune` (default 200)
+- Early stopping: stops after `patience` (default 10) epochs without improvement
 
 **Specify MAE weights / resume**:
 
@@ -202,7 +207,70 @@ python code/training/finetune_multitask.py --data_dir datasets --out_dir weights
                                                 # weights; run it ONCE per model)
 ```
 
-### 4.4 Inference (official format)
+### 4.4 Grid Search and Batch Training (gen_configs + run_grid)
+
+Sections 4.2/4.3 train **one** config by hand. The recommended sweep workflow is:
+generate a grid of legal configs first, then run them all through the same
+two-stage pipeline with one command.
+
+**Step 1 — generate the grid** (`utils/gen_configs.py`, single output file
+`code/configs/grid.json`):
+
+```bash
+python utils/gen_configs.py          # defaults, writes grid.json directly
+python utils/gen_configs.py --dry    # preview only
+
+# custom sweep axes (all accept multiple values; 'auto' allowed for bs/lr)
+python utils/gen_configs.py \
+    --d_model 512 768 1024 --n_layers 24 27 30 \
+    --batch_size auto 128 --lr auto \
+    --shared_ratio 0.85 0.90 0.95 \
+    --max_configs 20                 # keep only the 20 largest by params
+```
+
+Every entry is a complete, directly-trainable config. The generator enforces the
+competition red lines (**total params < 1B** via real model instantiation,
+**shared ratio > 80%**, `d_model % nhead == 0` for RoPE) and a VRAM ceiling
+(default 64 GB peak estimate) per config; illegal combos are skipped with a
+printed reason. Head capacity is swept via the shared-ratio tiers — head widths
+are solved so that shared ratio lands on 0.85/0.90/0.95 (names carry
+`_shared85/90/95` suffixes).
+
+**Step 2 — batch training** (`utils/run_grid.py`):
+
+```bash
+python utils/run_grid.py --dry        # list the pending configs
+python utils/run_grid.py             # run all pending configs sequentially
+python utils/run_grid.py --only 1024d_27l   # subset by name substring
+python utils/run_grid.py --retry      # rerun configs that failed last time
+```
+
+Each grid entry runs `pretrain_mae.py` then `finetune_multitask.py`
+(sequential, single GPU) with `--out_dir weights/<name>`. Per-config artifacts
+are archived to `logs/grid_runs/<name>/` (config.json, full stage logs,
+epoch/step metrics jsonl, plots). After each config finishes, the runner reads
+its best `val_proxy_score` and manages weights globally:
+
+- only the **single best-scoring set** in history is kept, in `weights/best/`
+  (`model.safetensors` + `config.json` + `param_stats.json`, official inference
+  format) plus `weights/best/best_config.json` (feed-back-to-training format)
+- non-best configs have their weights deleted right after their run finishes
+  (MAE checkpoints and resume files included) — pass `--keep_weights` to retain
+
+Batch-level outputs: `logs/grid_runs/best.json` (best config summary),
+`state.json` (progress; reruns skip done configs automatically),
+`summary.jsonl` (one line per config), and comparison plots
+`logs/grid_runs/plots/proxy_curves.png` + `best_bar.png`.
+
+**Log isolation note**: each training process still writes the shared
+`logs/{pretrain,finetune}_metrics.jsonl` and `logs/plots/` (they are reset at
+the start of a fresh run and archived per config immediately after it
+finishes). Do **not** start a manual training run while a batch is in
+progress, or the two would interleave in those shared files. TensorBoard event
+files under `logs/tb/` accumulate across runs (never reset) — use the archived
+per-config jsonl/plots as the source of truth after a batch.
+
+### 4.5 Inference (official format)
 
 ```bash
 python code/infer.py \
