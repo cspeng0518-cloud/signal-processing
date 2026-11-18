@@ -11,6 +11,13 @@
     "mask_ratio": 0.75,
     "mae_decoder_layers": 2,
     "head_hidden": 256,
+    "head_layers": 1,
+    "head_config": {
+      "protocol": { "hidden": 256, "layers": 1 },
+      "modulation": { "hidden": 256, "layers": 1 },
+      "parameter": { "hidden": 512, "layers": 2 },
+      "parameter_pattern": { "hidden": 512, "layers": 2 }
+    },
     "use_frequency": true,
     "layer_types": [
       "full_attention", "mla", "mla",
@@ -31,8 +38,8 @@
     "batch_size": 512,
     "lr": 0.0001,
     "weight_decay": 0.05,
-    "epochs_pretrain": 50,
-    "epochs_finetune": 60,
+    "epochs_pretrain": 200,
+    "epochs_finetune": 200,
     "warmup_ratio": 0.1,
     "num_workers": 4,
     "ref_scale": 0.5,
@@ -40,6 +47,7 @@
     "seed": 42,
     "amp": true,
     "patience": 10,
+    "patience_pretrain": 20,
     "eval_every": 1,
     "log_every": 20,
     "task_weights": {

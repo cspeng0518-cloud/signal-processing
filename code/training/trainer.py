@@ -217,6 +217,7 @@ class MAEPretrainer(BaseTrainer):
     def __init__(self, cfg, model, device, logger, out_dir, loader,
                  resume=None, smoke_steps=0, rank=0, world_size=1):
         self.loader = loader  # 须在 super().__init__ 前就位（调度器构建依赖）
+        self.best_loss, self.bad = float("inf"), 0  # 须在 super().__init__ 前（resume 依赖）
         super().__init__(cfg, model, device, logger, out_dir, resume, smoke_steps,
                          rank, world_size)
         self.out_dir.mkdir(parents=True, exist_ok=True)
@@ -266,8 +267,31 @@ class MAEPretrainer(BaseTrainer):
             self._log_scalars({"train/loss": loss_v,
                                "train/grad_norm": grad_norm,
                                "train/lr": self.scheduler.get_last_lr()[0]})
-        return {"recon_mse": total / max(1, count),
+        self._epoch_loss = total / max(1, count)
+        return {"recon_mse": self._epoch_loss,
                 "grad_norm": sum(norms) / max(1, len(norms))}
+
+    def on_epoch_end(self, epoch):
+        """预训练无验证集, 以训练 loss（recon_mse）作早停依据。"""
+        if self.smoke_steps:
+            return {}
+        if self._epoch_loss < self.best_loss:
+            self.best_loss, self.bad = self._epoch_loss, 0
+            self.logger.info("pretrain best recon_mse=%.5f", self.best_loss)
+        else:
+            self.bad += 1
+        return {}
+
+    def checkpoint_extra(self):
+        return {"best_loss": self.best_loss, "bad": self.bad}
+
+    def on_resume(self, extra):
+        self.best_loss = extra.get("best_loss", float("inf"))
+        self.bad = extra.get("bad", 0)
+
+    def should_stop(self):
+        # 训练 loss 连续 patience_pretrain 个 epoch 不下降即停
+        return self.bad >= self.tcfg.get("patience_pretrain", 20)
 
     def on_finish(self):
         export_pretrained(self.model, self.out_dir)
