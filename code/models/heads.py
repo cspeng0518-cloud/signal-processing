@@ -13,17 +13,22 @@ import torch
 import torch.nn as nn
 
 
-class ClassificationHead(nn.Module):
-    """轻量分类头：CLS -> MLP -> logits"""
+def _mlp(d_in, hidden, d_out, hidden_layers=1, dropout=0.1):
+    """可配深度 MLP: 输入投影 + (hidden_layers-1) 个 hidden 块 + 输出投影。"""
+    layers = [nn.Linear(d_in, hidden), nn.GELU(), nn.Dropout(dropout)]
+    for _ in range(max(0, hidden_layers - 1)):
+        layers += [nn.Linear(hidden, hidden), nn.GELU(), nn.Dropout(dropout)]
+    layers.append(nn.Linear(hidden, d_out))
+    return nn.Sequential(*layers)
 
-    def __init__(self, d_model=128, n_classes=8, hidden=256, dropout=0.1):
+
+class ClassificationHead(nn.Module):
+    """轻量分类头：CLS -> MLP -> logits（hidden_layers>1 时加深）"""
+
+    def __init__(self, d_model=128, n_classes=8, hidden=256, dropout=0.1,
+                 hidden_layers=1):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(d_model, hidden),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden, n_classes),
-        )
+        self.net = _mlp(d_model, hidden, n_classes, hidden_layers, dropout)
 
     def forward(self, ctx):
         return self.net(ctx[:, 0])  # CLS token 位置
@@ -34,15 +39,14 @@ class RegressionHead(nn.Module):
 
     输出经 sigmoid 映射到 [0,1]，训练前对参数做 min-max 归一化，
     推理时再反归一化回原始量纲（官方要求输出原始单位）。
+    hidden_layers>1 时可加深（parameter 任务重，允许单独加容量）。
     """
 
-    def __init__(self, d_model=128, n_params=7, hidden=256, dropout=0.1):
+    def __init__(self, d_model=128, n_params=7, hidden=256, dropout=0.1,
+                 hidden_layers=1):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(d_model, hidden),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden, n_params),
+            _mlp(d_model, hidden, n_params, hidden_layers, dropout),
             nn.Sigmoid(),  # 归一化参数空间 [0,1]
         )
         self.n_params = n_params

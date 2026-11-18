@@ -102,19 +102,39 @@ class EMFoundation(nn.Module):
         nn.init.trunc_normal_(self.mask_token, std=0.02)
         self.patch_size = patch_size
         # ---- 任务私有 head（task_heads 唯一持有，避免 safetensors 共享内存冲突）----
+        # 头部容量按任务独立配置, 三级回退:
+        #   head_config.<task>.{hidden,layers}  → 全局 head_hidden/head_layers → 256/1
+        # 任务难度不同允许不同参数量（parameter 7 参数联合回归计算量最大）;
+        # parameter_pattern 未单独指定时跟随 parameter 档（同属 parameter 任务）。
+        head_cfg = config.get("head_config", {})
+        g_hidden = config.get("head_hidden", 256)
+        g_layers = config.get("head_layers", 1)
+
+        def _dims(task):
+            t = head_cfg.get(task, {}) or {}
+            return t.get("hidden", g_hidden), t.get("layers", g_layers)
+
+        h_p, l_p = _dims("protocol")
+        h_m, l_m = _dims("modulation")
+        h_pa, l_pa = _dims("parameter")
+        _pat = head_cfg.get("parameter_pattern", {}) or {}
+        h_pat = _pat.get("hidden", h_pa)
+        l_pat = _pat.get("layers", l_pa)
+
         self.task_heads = nn.ModuleDict({
-            "protocol": ClassificationHead(d_model, N_PROTOCOL,
-                                            config.get("head_hidden", 256)),
-            "modulation": ClassificationHead(d_model, N_MODULATION,
-                                             config.get("head_hidden", 256)),
-            "parameter": RegressionHead(d_model, N_PARAMS,
-                                        config.get("head_hidden", 256)),
+            "protocol": ClassificationHead(d_model, N_PROTOCOL, h_p,
+                                           hidden_layers=l_p),
+            "modulation": ClassificationHead(d_model, N_MODULATION, h_m,
+                                              hidden_layers=l_m),
+            "parameter": RegressionHead(d_model, N_PARAMS, h_pa,
+                                        hidden_layers=l_pa),
         })
         # parameter 辅助头：通信/雷达模式二分类
         # （官方数据 valid 严格二分: 1110000 通信 / 0001111 雷达，
         #   推理时由该头硬决定不适用参数输出 0.0）
         self.task_heads["parameter_pattern"] = ClassificationHead(d_model, 2,
-                                                                  config.get("head_hidden", 256))
+                                                                  h_pat,
+                                                                  hidden_layers=l_pat)
         self._init_weights()
 
     # ------------------------------------------------------------------
