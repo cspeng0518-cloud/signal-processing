@@ -165,7 +165,7 @@ python code/training/pretrain_mae.py \
 - Shared weights are exported once at the end to `weights/mae_pretrained.pt`
 - Epoch cap `epochs_pretrain` (default 200); no validation split exists for MAE,
   so early stopping tracks the **training loss** (`recon_mse`): after
-  `patience_pretrain` (default 20) epochs without a new low, training stops
+  `patience_pretrain` (default 10) epochs without a new low, training stops
   (counter round-trips through the resume checkpoint)
 
 **Resume from interruption**:
@@ -222,7 +222,7 @@ python utils/gen_configs.py --dry    # preview only
 
 # custom sweep axes (all accept multiple values; 'auto' allowed for bs/lr)
 python utils/gen_configs.py \
-    --d_model 512 768 1024 --n_layers 24 27 30 \
+    --d_model 1024 1536 --n_layers 21 24 33 36 \
     --batch_size auto 128 --lr auto \
     --shared_ratio 0.85 0.90 0.95 \
     --max_configs 20                 # keep only the 20 largest by params
@@ -230,11 +230,26 @@ python utils/gen_configs.py \
 
 Every entry is a complete, directly-trainable config. The generator enforces the
 competition red lines (**total params < 1B** via real model instantiation,
-**shared ratio > 80%**, `d_model % nhead == 0` for RoPE) and a VRAM ceiling
-(default 64 GB peak estimate) per config; illegal combos are skipped with a
-printed reason. Head capacity is swept via the shared-ratio tiers — head widths
+**shared ratio > 80%**, `d_model % nhead == 0` for RoPE), a **600M params
+floor** (`--min_params`, default 600 — the competition allows up to 1B, so stay
+large; smaller models are dropped as low-quality), and a VRAM ceiling
+(default 74 GB peak estimate) per config; illegal combos are skipped with a
+printed reason. Default sweep axes are d_model 1024/1536 × 18–39 layers every
+3 (1536 uses shallow 18/21/24; 1024 is deepened to 33/36/39 to clear the
+floor). Head capacity is swept via the shared-ratio tiers — head widths
 are solved so that shared ratio lands on 0.85/0.90/0.95 (names carry
 `_shared85/90/95` suffixes).
+
+**Optional — calibrate the VRAM estimate against reality** (`utils/probe_vram.py`):
+the estimator is anchored at d512/27L, so extrapolating to 1024/1536 may drift.
+The probe smoke-runs each grid config for a few **real** training steps (both
+stages) in a wrapper subprocess and records the in-process
+`max_memory_allocated` peak, then compares it with the estimate
+(`python utils/probe_vram.py --dry` lists the plan; `--only`/`--limit` probe a
+subset). `--apply` writes the worst real/estimate ratio into
+`code/configs/vram_calibration.json`, which `gen_configs.py` automatically
+multiplies into all estimates on subsequent runs (closed loop). A config whose
+smoke run OOMs is reported as underestimated.
 
 **Step 2 — batch training** (`utils/run_grid.py`):
 

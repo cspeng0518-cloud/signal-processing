@@ -1,8 +1,8 @@
 """调参配置生成器：按网格/指定参数批量生成合法 config
 
 用法:
-    # 默认网格: d_model 256~1024 步进256 × 层数 24/27/30 × batch 128/256/512 × lr auto,
-    #           直接落盘 code/configs/grid.json
+    # 默认网格: d_model 1024/1536 × 层数 18~39(每3层一档) × batch 128/256/512 × lr auto,
+    #           参数量下限 600M(--min_params), 直接落盘 code/configs/grid.json
     python utils/gen_configs.py
 
     # 只预览不落盘
@@ -18,8 +18,8 @@
     # ffn_hidden 自动撑满 1B 参数预算（二分搜索 64 对齐）
     python utils/gen_configs.py --d_model 1024 --ffn_hidden max
 
-    # 显存预算（默认 80GB = A800 单卡）
-    python utils/gen_configs.py --vram 80
+    # 显存预算（默认 74GB, 80G 卡留 ~6G 物理余量）
+    python utils/gen_configs.py --vram 64
 
 输出格式（默认落盘, 单一 JSON 文件）:
     {"vram_budget_gb": ..., "configs": [
@@ -33,6 +33,8 @@
   2. 权重共用率 > 80% (tokenizer+backbone / 任务头, 实测 >99%, 自动校验)
   3. d_model % nhead == 0 且 head_dim 偶数（RoPE 旋转要求）
   4. 显存估算不超 --vram × --headroom 预算（估算模型见 vram_estimate 文档字符串）
+  5. 参数量 ≥ --min_params（默认 600M; 赛方上限 1B, 尽量顶格做大规模,
+     低于下限视为劣质配置剔除——小容量模型学不动百万级大样本）
 
 自动推导规则:
   nhead      = d_model // 64（head_dim 固定 64, 与现有配置一致）
@@ -46,7 +48,8 @@
       命名后缀 _shared85/_shared90/_shared95
     显式模式: 传任一 --head_hidden_* / --head_layers_* 即切换六维扫参,
       命名后缀 _protoHead512x1 / _modHead256x2 / _paramHead1024x2
-  显存       默认预算 64GB, 估算峰值 ≤ 64GB（80G 卡上用户自留 16G 余量的保守上限）
+  显存       默认预算 74GB, 估算峰值 ≤ 74GB（80G 卡留 ~6G 物理余量; probe_vram
+             实测校准系数 vram_calibration.json 存在时自动相乘）
   截断       默认按参数量降序只保留最大的 20 组（--max_configs 可调, 0 = 不截断）
 
 冻结字段（backbone/patch_size/mask_ratio/epochs/patience/task_weights 等）取
@@ -70,6 +73,15 @@ PATCH = 8                          # 与全部现有配置一致
 N_TOKENS = SEQ_LEN // PATCH + 2    # 130（含 CLS/SR）
 HEAD_DIM = 64                      # nhead 推导基准
 LR_REF_BS = 16                     # lr sqrt 缩放基线: bs16 @ 1e-4
+# 实测校准系数（utils/probe_vram.py --apply 生成 vram_calibration.json;
+# 缺省 1.0 = 未校准, 估算公式原样生效）
+_CALIBRATION_PATH = os.path.join(ROOT, "code", "configs", "vram_calibration.json")
+try:
+    VRAM_CALIB = float(json.load(open(_CALIBRATION_PATH, encoding="utf-8"))["factor"])
+    if not (0.5 <= VRAM_CALIB <= 3.0):
+        VRAM_CALIB = 1.0
+except Exception:
+    VRAM_CALIB = 1.0
 # 基线头配置（default.json head_config 同款; 共用率模式下仅用于测共享绝对量）
 BASE_HEAD_CONFIG = {
     "protocol": {"hidden": 256, "layers": 1},
@@ -167,7 +179,7 @@ def vram_estimate_gb(total_params, d_model, n_layers, ffn_hidden, nhead, bs):
     fwd_ft = (n_layers * per_layer(L_full) + freq_misc) * bs
     static = 16 * total_params
     peak = max(static + 1.25 * fwd_pre, static + 1.25 * fwd_ft) + 4e9
-    return peak / 1e9
+    return VRAM_CALIB * peak / 1e9
 
 def max_batch_size(total_params, d_model, n_layers, ffn_hidden, nhead,
                    vram_gb, headroom, min_bs=256):
@@ -236,8 +248,13 @@ def build_config(base, d_model, n_layers, ffn_hidden, bs, lr, head_config):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--d_model", nargs="+", type=int, default=[256, 512, 768, 1024])
-    ap.add_argument("--n_layers", nargs="+", type=int, default=[24, 27, 30])
+    ap.add_argument("--d_model", nargs="+", type=int, default=[1024, 1536],
+                    help="宽度网格（默认聚焦 1024/1536 大宽度: 256/512/768 在 "
+                         "40 层上限内够不到 600M 下限, 默认不扫, 显式传入仍支持）")
+    ap.add_argument("--n_layers", nargs="+", type=int,
+                    default=[18, 21, 24, 27, 30, 33, 36, 39],
+                    help="层数网格（默认 18~39 每 3 层一档: 1536 宽度用浅档 "
+                         "18/21/24, 1024 宽度需加深到 33/36/39 才够 600M 下限）")
     ap.add_argument("--ffn_hidden", nargs="+", type=str, default=None,
                     help="如 '2048 6400'；'max'=自动撑满 1B；缺省=4×d_model 对齐 64")
     ap.add_argument("--batch_size", nargs="+", type=str, default=["128", "256", "512"],
@@ -262,9 +279,14 @@ def main():
                          "按 backbone 共享量反解各任务头宽度, 难度权重 "
                          "protocol 0.2 / modulation 0.2 / parameter 0.3+pattern 0.3, "
                          "深度固定 2 层）")
-    ap.add_argument("--vram", type=float, default=64.0, help="显存预算 GB（默认 64）")
+    ap.add_argument("--vram", type=float, default=74.0,
+                    help="显存预算 GB（默认 74, 80G 卡留 ~6G 物理余量; "
+                         "1536 宽度需 ≥74, 1472 宽度需 ≥72, 否则被预算剔除）")
     ap.add_argument("--headroom", type=float, default=1.0,
-                    help="显存安全余量比例（默认 1.0, 即估算峰值 ≤ 64GB 预算内）")
+                    help="显存安全余量比例（默认 1.0, 即估算峰值 ≤ 预算内）")
+    ap.add_argument("--min_params", type=float, default=600.0, metavar="M",
+                    help="参数量下限, 单位 M（默认 600: 赛方限 1B 上限, 尽量 "
+                         "顶格做大规模; 低于下限视为劣质配置直接剔除）")
     ap.add_argument("--min_batch_size", type=int, default=128,
                     help="batch 下限（数据集大, 默认 128 起步；显存吃紧可调低）")
     ap.add_argument("--max_configs", type=int, default=20,
@@ -275,6 +297,9 @@ def main():
     args = ap.parse_args()
 
     base = json.load(open(os.path.join(ROOT, "code", "configs", "default.json")))
+    if VRAM_CALIB != 1.0:
+        print(f"[calib] 显存估算 × 实测校准系数 {VRAM_CALIB:.2f} "
+              f"(vram_calibration.json, probe_vram --apply 生成)")
 
     # 头部网格两模式:
     #   共用率模式(默认): --shared_ratio 三档, 按 backbone 共享量反解头宽度
@@ -340,6 +365,11 @@ def main():
                         }
                     total, shared_n, heads_n = measure(d, n, f, nhead, head_config)
                     ratio = shared_n / (shared_n + heads_n)
+                    if total < args.min_params * 1e6:
+                        print(f"[skip] d={d} n={n} ffn={f}{head_tag}: 参数 "
+                              f"{total/1e6:.0f}M < {args.min_params:.0f}M 下限"
+                              f"（赛方限 1B 尽量顶格, --min_params 可调）")
+                        continue
                     if total >= MAX_TOTAL_PARAMS:
                         print(f"[skip] d={d} n={n} ffn={f}{head_tag}: 参数 "
                               f"{total/1e6:.0f}M ≥ 1B 红线")

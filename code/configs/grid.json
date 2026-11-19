@@ -1,14 +1,14 @@
 {
-  "vram_budget_gb": 64.0,
+  "vram_budget_gb": 74.0,
   "headroom": 1.0,
   "n_tokens": 130,
   "configs": [
     {
-      "name": "gen_1024d_30l_4096ffn_128b_lr3e-04_shared85",
+      "name": "gen_1024d_33l_4096ffn_128b_lr3e-04_shared85",
       "model": {
         "backbone": "hybrid",
         "d_model": 1024,
-        "n_layers": 30,
+        "n_layers": 33,
         "nhead": 16,
         "ffn_hidden": 4096,
         "patch_size": 8,
@@ -20,19 +20,19 @@
         "head_layers": 1,
         "head_config": {
           "protocol": {
-            "hidden": 3584,
+            "hidden": 3776,
             "layers": 2
           },
           "modulation": {
-            "hidden": 3584,
+            "hidden": 3776,
             "layers": 2
           },
           "parameter": {
-            "hidden": 4480,
+            "hidden": 4672,
             "layers": 2
           },
           "parameter_pattern": {
-            "hidden": 4480,
+            "hidden": 4672,
             "layers": 2
           }
         },
@@ -59,7 +59,7 @@
         "seed": 42,
         "amp": true,
         "patience": 10,
-        "patience_pretrain": 20,
+        "patience_pretrain": 10,
         "eval_every": 1,
         "log_every": 20,
         "task_weights": {
@@ -68,16 +68,16 @@
           "parameter": 0.4
         }
       },
-      "params_M": 580.07084,
-      "shared_ratio": 0.8489796138253058,
-      "vram_est_gb": 57.478448
+      "params_M": 632.96812,
+      "shared_ratio": 0.8504016077791813,
+      "vram_est_gb": 62.68581568
     },
     {
-      "name": "gen_1024d_30l_4096ffn_128b_lr3e-04_shared90",
+      "name": "gen_1024d_33l_4096ffn_128b_lr3e-04_shared90",
       "model": {
         "backbone": "hybrid",
         "d_model": 1024,
-        "n_layers": 30,
+        "n_layers": 33,
         "nhead": 16,
         "ffn_hidden": 4096,
         "patch_size": 8,
@@ -89,19 +89,19 @@
         "head_layers": 1,
         "head_config": {
           "protocol": {
-            "hidden": 2752,
+            "hidden": 2880,
             "layers": 2
           },
           "modulation": {
-            "hidden": 2752,
+            "hidden": 2880,
             "layers": 2
           },
           "parameter": {
-            "hidden": 3456,
+            "hidden": 3648,
             "layers": 2
           },
           "parameter_pattern": {
-            "hidden": 3456,
+            "hidden": 3648,
             "layers": 2
           }
         },
@@ -128,7 +128,7 @@
         "seed": 42,
         "amp": true,
         "patience": 10,
-        "patience_pretrain": 20,
+        "patience_pretrain": 10,
         "eval_every": 1,
         "log_every": 20,
         "task_weights": {
@@ -137,16 +137,16 @@
           "parameter": 0.4
         }
       },
-      "params_M": 549.431288,
-      "shared_ratio": 0.8994066931476947,
-      "vram_est_gb": 56.988215168
+      "params_M": 600.024376,
+      "shared_ratio": 0.8998608713676144,
+      "vram_est_gb": 62.158715776
     },
     {
-      "name": "gen_1024d_27l_4096ffn_128b_lr3e-04_shared85",
+      "name": "gen_1024d_36l_4096ffn_128b_lr3e-04_shared85",
       "model": {
         "backbone": "hybrid",
         "d_model": 1024,
-        "n_layers": 27,
+        "n_layers": 36,
         "nhead": 16,
         "ffn_hidden": 4096,
         "patch_size": 8,
@@ -158,19 +158,19 @@
         "head_layers": 1,
         "head_config": {
           "protocol": {
-            "hidden": 3328,
+            "hidden": 3968,
             "layers": 2
           },
           "modulation": {
-            "hidden": 3328,
+            "hidden": 3904,
             "layers": 2
           },
           "parameter": {
-            "hidden": 4224,
+            "hidden": 4928,
             "layers": 2
           },
           "parameter_pattern": {
-            "hidden": 4224,
+            "hidden": 4928,
             "layers": 2
           }
         },
@@ -197,7 +197,7 @@
         "seed": 42,
         "amp": true,
         "patience": 10,
-        "patience_pretrain": 20,
+        "patience_pretrain": 10,
         "eval_every": 1,
         "log_every": 20,
         "task_weights": {
@@ -206,16 +206,16 @@
           "parameter": 0.4
         }
       },
-      "params_M": 525.25356,
-      "shared_ratio": 0.8505614468595083,
-      "vram_est_gb": 52.24036032
+      "params_M": 686.974648,
+      "shared_ratio": 0.8501472180938031,
+      "vram_est_gb": 67.910931328
     },
     {
-      "name": "gen_1024d_30l_4096ffn_128b_lr3e-04_shared95",
+      "name": "gen_1024d_36l_4096ffn_128b_lr3e-04_shared90",
       "model": {
         "backbone": "hybrid",
         "d_model": 1024,
-        "n_layers": 30,
+        "n_layers": 36,
         "nhead": 16,
         "ffn_hidden": 4096,
         "patch_size": 8,
@@ -227,19 +227,19 @@
         "head_layers": 1,
         "head_config": {
           "protocol": {
-            "hidden": 1728,
+            "hidden": 3008,
             "layers": 2
           },
           "modulation": {
-            "hidden": 1728,
+            "hidden": 3008,
             "layers": 2
           },
           "parameter": {
-            "hidden": 2240,
+            "hidden": 3840,
             "layers": 2
           },
           "parameter_pattern": {
-            "hidden": 2240,
+            "hidden": 3840,
             "layers": 2
           }
         },
@@ -266,7 +266,7 @@
         "seed": 42,
         "amp": true,
         "patience": 10,
-        "patience_pretrain": 20,
+        "patience_pretrain": 10,
         "eval_every": 1,
         "log_every": 20,
         "task_weights": {
@@ -275,16 +275,16 @@
           "parameter": 0.4
         }
       },
-      "params_M": 521.764408,
-      "shared_ratio": 0.9503798521724175,
-      "vram_est_gb": 56.545545088
+      "params_M": 650.830456,
+      "shared_ratio": 0.8999299216054909,
+      "vram_est_gb": 67.332624256
     },
     {
-      "name": "gen_1024d_27l_4096ffn_128b_lr3e-04_shared90",
+      "name": "gen_1024d_36l_4096ffn_128b_lr3e-04_shared95",
       "model": {
         "backbone": "hybrid",
         "d_model": 1024,
-        "n_layers": 27,
+        "n_layers": 36,
         "nhead": 16,
         "ffn_hidden": 4096,
         "patch_size": 8,
@@ -296,19 +296,19 @@
         "head_layers": 1,
         "head_config": {
           "protocol": {
-            "hidden": 2560,
+            "hidden": 1984,
             "layers": 2
           },
           "modulation": {
-            "hidden": 2560,
+            "hidden": 1920,
             "layers": 2
           },
           "parameter": {
-            "hidden": 3264,
+            "hidden": 2496,
             "layers": 2
           },
           "parameter_pattern": {
-            "hidden": 3264,
+            "hidden": 2496,
             "layers": 2
           }
         },
@@ -335,7 +335,7 @@
         "seed": 42,
         "amp": true,
         "patience": 10,
-        "patience_pretrain": 20,
+        "patience_pretrain": 10,
         "eval_every": 1,
         "log_every": 20,
         "task_weights": {
@@ -344,16 +344,16 @@
           "parameter": 0.4
         }
       },
-      "params_M": 498.254328,
-      "shared_ratio": 0.8999831878533144,
-      "vram_est_gb": 51.808372608
+      "params_M": 618.355704,
+      "shared_ratio": 0.9499072291238235,
+      "vram_est_gb": 66.813028224
     },
     {
-      "name": "gen_1024d_27l_4096ffn_128b_lr3e-04_shared95",
+      "name": "gen_1024d_39l_4096ffn_128b_lr3e-04_shared85",
       "model": {
         "backbone": "hybrid",
         "d_model": 1024,
-        "n_layers": 27,
+        "n_layers": 39,
         "nhead": 16,
         "ffn_hidden": 4096,
         "patch_size": 8,
@@ -365,19 +365,19 @@
         "head_layers": 1,
         "head_config": {
           "protocol": {
-            "hidden": 1664,
+            "hidden": 4096,
             "layers": 2
           },
           "modulation": {
-            "hidden": 1664,
+            "hidden": 4096,
             "layers": 2
           },
           "parameter": {
-            "hidden": 2112,
+            "hidden": 5120,
             "layers": 2
           },
           "parameter_pattern": {
-            "hidden": 2112,
+            "hidden": 5120,
             "layers": 2
           }
         },
@@ -404,7 +404,7 @@
         "seed": 42,
         "amp": true,
         "patience": 10,
-        "patience_pretrain": 20,
+        "patience_pretrain": 10,
         "eval_every": 1,
         "log_every": 20,
         "task_weights": {
@@ -413,16 +413,16 @@
           "parameter": 0.4
         }
       },
-      "params_M": 474.057976,
-      "shared_ratio": 0.9494222513774949,
-      "vram_est_gb": 51.421230976
+      "params_M": 739.891768,
+      "shared_ratio": 0.8512426166797782,
+      "vram_est_gb": 73.118616448
     },
     {
-      "name": "gen_1024d_24l_4096ffn_128b_lr3e-04_shared85",
+      "name": "gen_1024d_39l_4096ffn_128b_lr3e-04_shared90",
       "model": {
         "backbone": "hybrid",
         "d_model": 1024,
-        "n_layers": 24,
+        "n_layers": 39,
         "nhead": 16,
         "ffn_hidden": 4096,
         "patch_size": 8,
@@ -434,11 +434,11 @@
         "head_layers": 1,
         "head_config": {
           "protocol": {
-            "hidden": 3136,
+            "hidden": 3200,
             "layers": 2
           },
           "modulation": {
-            "hidden": 3136,
+            "hidden": 3200,
             "layers": 2
           },
           "parameter": {
@@ -473,7 +473,7 @@
         "seed": 42,
         "amp": true,
         "patience": 10,
-        "patience_pretrain": 20,
+        "patience_pretrain": 10,
         "eval_every": 1,
         "log_every": 20,
         "task_weights": {
@@ -482,225 +482,18 @@
           "parameter": 0.4
         }
       },
-      "params_M": 471.888504,
-      "shared_ratio": 0.8497155279317861,
-      "vram_est_gb": 47.025508224
+      "params_M": 701.637944,
+      "shared_ratio": 0.8999865722154409,
+      "vram_est_gb": 72.506555264
     },
     {
-      "name": "gen_1024d_24l_4096ffn_128b_lr3e-04_shared90",
+      "name": "gen_1024d_39l_4096ffn_128b_lr3e-04_shared95",
       "model": {
         "backbone": "hybrid",
         "d_model": 1024,
-        "n_layers": 24,
+        "n_layers": 39,
         "nhead": 16,
         "ffn_hidden": 4096,
-        "patch_size": 8,
-        "sr_bins": 64,
-        "pos_encoding": "rope",
-        "mask_ratio": 0.75,
-        "mae_decoder_layers": 2,
-        "head_hidden": 256,
-        "head_layers": 1,
-        "head_config": {
-          "protocol": {
-            "hidden": 2432,
-            "layers": 2
-          },
-          "modulation": {
-            "hidden": 2368,
-            "layers": 2
-          },
-          "parameter": {
-            "hidden": 3072,
-            "layers": 2
-          },
-          "parameter_pattern": {
-            "hidden": 3072,
-            "layers": 2
-          }
-        },
-        "use_frequency": true,
-        "layer_types": [
-          "full_attention",
-          "mla",
-          "mla"
-        ],
-        "mla_kv_lora_rank": 128,
-        "mla_q_lora_rank": 128
-      },
-      "training": {
-        "seq_len": 1024,
-        "batch_size": 128,
-        "lr": 0.000283,
-        "weight_decay": 0.05,
-        "epochs_pretrain": 200,
-        "epochs_finetune": 200,
-        "warmup_ratio": 0.1,
-        "num_workers": 4,
-        "ref_scale": 0.5,
-        "grad_clip": 1.0,
-        "seed": 42,
-        "amp": true,
-        "patience": 10,
-        "patience_pretrain": 20,
-        "eval_every": 1,
-        "log_every": 20,
-        "task_weights": {
-          "protocol": 0.3,
-          "modulation": 0.3,
-          "parameter": 0.4
-        }
-      },
-      "params_M": 447.745656,
-      "shared_ratio": 0.8992489987477357,
-      "vram_est_gb": 46.639222656
-    },
-    {
-      "name": "gen_1024d_24l_4096ffn_128b_lr3e-04_shared95",
-      "model": {
-        "backbone": "hybrid",
-        "d_model": 1024,
-        "n_layers": 24,
-        "nhead": 16,
-        "ffn_hidden": 4096,
-        "patch_size": 8,
-        "sr_bins": 64,
-        "pos_encoding": "rope",
-        "mask_ratio": 0.75,
-        "mae_decoder_layers": 2,
-        "head_hidden": 256,
-        "head_layers": 1,
-        "head_config": {
-          "protocol": {
-            "hidden": 1536,
-            "layers": 2
-          },
-          "modulation": {
-            "hidden": 1536,
-            "layers": 2
-          },
-          "parameter": {
-            "hidden": 1984,
-            "layers": 2
-          },
-          "parameter_pattern": {
-            "hidden": 1984,
-            "layers": 2
-          }
-        },
-        "use_frequency": true,
-        "layer_types": [
-          "full_attention",
-          "mla",
-          "mla"
-        ],
-        "mla_kv_lora_rank": 128,
-        "mla_q_lora_rank": 128
-      },
-      "training": {
-        "seq_len": 1024,
-        "batch_size": 128,
-        "lr": 0.000283,
-        "weight_decay": 0.05,
-        "epochs_pretrain": 200,
-        "epochs_finetune": 200,
-        "warmup_ratio": 0.1,
-        "num_workers": 4,
-        "ref_scale": 0.5,
-        "grad_clip": 1.0,
-        "seed": 42,
-        "amp": true,
-        "patience": 10,
-        "patience_pretrain": 20,
-        "eval_every": 1,
-        "log_every": 20,
-        "task_weights": {
-          "protocol": 0.3,
-          "modulation": 0.3,
-          "parameter": 0.4
-        }
-      },
-      "params_M": 425.898744,
-      "shared_ratio": 0.9493264657033036,
-      "vram_est_gb": 46.289672064
-    },
-    {
-      "name": "gen_768d_30l_3072ffn_128b_lr3e-04_shared85",
-      "model": {
-        "backbone": "hybrid",
-        "d_model": 768,
-        "n_layers": 30,
-        "nhead": 12,
-        "ffn_hidden": 3072,
-        "patch_size": 8,
-        "sr_bins": 64,
-        "pos_encoding": "rope",
-        "mask_ratio": 0.75,
-        "mae_decoder_layers": 2,
-        "head_hidden": 256,
-        "head_layers": 1,
-        "head_config": {
-          "protocol": {
-            "hidden": 2688,
-            "layers": 2
-          },
-          "modulation": {
-            "hidden": 2688,
-            "layers": 2
-          },
-          "parameter": {
-            "hidden": 3392,
-            "layers": 2
-          },
-          "parameter_pattern": {
-            "hidden": 3392,
-            "layers": 2
-          }
-        },
-        "use_frequency": true,
-        "layer_types": [
-          "full_attention",
-          "mla",
-          "mla"
-        ],
-        "mla_kv_lora_rank": 128,
-        "mla_q_lora_rank": 128
-      },
-      "training": {
-        "seq_len": 1024,
-        "batch_size": 128,
-        "lr": 0.000283,
-        "weight_decay": 0.05,
-        "epochs_pretrain": 200,
-        "epochs_finetune": 200,
-        "warmup_ratio": 0.1,
-        "num_workers": 4,
-        "ref_scale": 0.5,
-        "grad_clip": 1.0,
-        "seed": 42,
-        "amp": true,
-        "patience": 10,
-        "patience_pretrain": 20,
-        "eval_every": 1,
-        "log_every": 20,
-        "task_weights": {
-          "protocol": 0.3,
-          "modulation": 0.3,
-          "parameter": 0.4
-        }
-      },
-      "params_M": 330.049784,
-      "shared_ratio": 0.8491424224032947,
-      "vram_est_gb": 42.470725504
-    },
-    {
-      "name": "gen_768d_30l_3072ffn_128b_lr3e-04_shared90",
-      "model": {
-        "backbone": "hybrid",
-        "d_model": 768,
-        "n_layers": 30,
-        "nhead": 12,
-        "ffn_hidden": 3072,
         "patch_size": 8,
         "sr_bins": 64,
         "pos_encoding": "rope",
@@ -749,7 +542,7 @@
         "seed": 42,
         "amp": true,
         "patience": 10,
-        "patience_pretrain": 20,
+        "patience_pretrain": 10,
         "eval_every": 1,
         "log_every": 20,
         "task_weights": {
@@ -758,18 +551,18 @@
           "parameter": 0.4
         }
       },
-      "params_M": 312.552056,
-      "shared_ratio": 0.8997401512201608,
-      "vram_est_gb": 42.190761856
+      "params_M": 666.657656,
+      "shared_ratio": 0.949715544333664,
+      "vram_est_gb": 71.946870656
     },
     {
-      "name": "gen_768d_27l_3072ffn_128b_lr3e-04_shared85",
+      "name": "gen_1536d_18l_6144ffn_128b_lr3e-04_shared85",
       "model": {
         "backbone": "hybrid",
-        "d_model": 768,
-        "n_layers": 27,
-        "nhead": 12,
-        "ffn_hidden": 3072,
+        "d_model": 1536,
+        "n_layers": 18,
+        "nhead": 24,
+        "ffn_hidden": 6144,
         "patch_size": 8,
         "sr_bins": 64,
         "pos_encoding": "rope",
@@ -779,19 +572,19 @@
         "head_layers": 1,
         "head_config": {
           "protocol": {
-            "hidden": 2560,
+            "hidden": 3968,
             "layers": 2
           },
           "modulation": {
-            "hidden": 2560,
+            "hidden": 3968,
             "layers": 2
           },
           "parameter": {
-            "hidden": 3200,
+            "hidden": 5056,
             "layers": 2
           },
           "parameter_pattern": {
-            "hidden": 3200,
+            "hidden": 5056,
             "layers": 2
           }
         },
@@ -818,7 +611,7 @@
         "seed": 42,
         "amp": true,
         "patience": 10,
-        "patience_pretrain": 20,
+        "patience_pretrain": 10,
         "eval_every": 1,
         "log_every": 20,
         "task_weights": {
@@ -827,18 +620,18 @@
           "parameter": 0.4
         }
       },
-      "params_M": 299.613112,
-      "shared_ratio": 0.8483647900746961,
-      "vram_est_gb": 38.712980352
+      "params_M": 810.351992,
+      "shared_ratio": 0.8495609906459213,
+      "vram_est_gb": 57.011650432
     },
     {
-      "name": "gen_768d_30l_3072ffn_128b_lr3e-04_shared95",
+      "name": "gen_1536d_18l_6144ffn_128b_lr3e-04_shared90",
       "model": {
         "backbone": "hybrid",
-        "d_model": 768,
-        "n_layers": 30,
-        "nhead": 12,
-        "ffn_hidden": 3072,
+        "d_model": 1536,
+        "n_layers": 18,
+        "nhead": 24,
+        "ffn_hidden": 6144,
         "patch_size": 8,
         "sr_bins": 64,
         "pos_encoding": "rope",
@@ -848,19 +641,19 @@
         "head_layers": 1,
         "head_config": {
           "protocol": {
-            "hidden": 1344,
+            "hidden": 3008,
             "layers": 2
           },
           "modulation": {
-            "hidden": 1344,
+            "hidden": 3008,
             "layers": 2
           },
           "parameter": {
-            "hidden": 1664,
+            "hidden": 3840,
             "layers": 2
           },
           "parameter_pattern": {
-            "hidden": 1664,
+            "hidden": 3840,
             "layers": 2
           }
         },
@@ -887,7 +680,7 @@
         "seed": 42,
         "amp": true,
         "patience": 10,
-        "patience_pretrain": 20,
+        "patience_pretrain": 10,
         "eval_every": 1,
         "log_every": 20,
         "task_weights": {
@@ -896,18 +689,18 @@
           "parameter": 0.4
         }
       },
-      "params_M": 296.950136,
-      "shared_ratio": 0.9502265055043992,
-      "vram_est_gb": 41.941131136
+      "params_M": 768.58892,
+      "shared_ratio": 0.9007562982809973,
+      "vram_est_gb": 56.34344128
     },
     {
-      "name": "gen_768d_27l_3072ffn_128b_lr3e-04_shared90",
+      "name": "gen_1536d_18l_6144ffn_128b_lr3e-04_shared95",
       "model": {
         "backbone": "hybrid",
-        "d_model": 768,
-        "n_layers": 27,
-        "nhead": 12,
-        "ffn_hidden": 3072,
+        "d_model": 1536,
+        "n_layers": 18,
+        "nhead": 24,
+        "ffn_hidden": 6144,
         "patch_size": 8,
         "sr_bins": 64,
         "pos_encoding": "rope",
@@ -956,7 +749,7 @@
         "seed": 42,
         "amp": true,
         "patience": 10,
-        "patience_pretrain": 20,
+        "patience_pretrain": 10,
         "eval_every": 1,
         "log_every": 20,
         "task_weights": {
@@ -965,18 +758,18 @@
           "parameter": 0.4
         }
       },
-      "params_M": 283.032888,
-      "shared_ratio": 0.9016188383409932,
-      "vram_est_gb": 38.447696768
+      "params_M": 732.479544,
+      "shared_ratio": 0.9502681674713552,
+      "vram_est_gb": 55.765691264
     },
     {
-      "name": "gen_768d_27l_3072ffn_128b_lr3e-04_shared95",
+      "name": "gen_1536d_21l_6144ffn_128b_lr3e-04_shared85",
       "model": {
         "backbone": "hybrid",
-        "d_model": 768,
-        "n_layers": 27,
-        "nhead": 12,
-        "ffn_hidden": 3072,
+        "d_model": 1536,
+        "n_layers": 21,
+        "nhead": 24,
+        "ffn_hidden": 6144,
         "patch_size": 8,
         "sr_bins": 64,
         "pos_encoding": "rope",
@@ -986,19 +779,19 @@
         "head_layers": 1,
         "head_config": {
           "protocol": {
-            "hidden": 1216,
+            "hidden": 4352,
             "layers": 2
           },
           "modulation": {
-            "hidden": 1216,
+            "hidden": 4352,
             "layers": 2
           },
           "parameter": {
-            "hidden": 1600,
+            "hidden": 5504,
             "layers": 2
           },
           "parameter_pattern": {
-            "hidden": 1600,
+            "hidden": 5504,
             "layers": 2
           }
         },
@@ -1025,7 +818,7 @@
         "seed": 42,
         "amp": true,
         "patience": 10,
-        "patience_pretrain": 20,
+        "patience_pretrain": 10,
         "eval_every": 1,
         "log_every": 20,
         "task_weights": {
@@ -1034,18 +827,18 @@
           "parameter": 0.4
         }
       },
-      "params_M": 269.5134,
-      "shared_ratio": 0.950257444834994,
-      "vram_est_gb": 38.23138496
+      "params_M": 930.450104,
+      "shared_ratio": 0.8491407689987598,
+      "vram_est_gb": 65.474737024
     },
     {
-      "name": "gen_768d_24l_3072ffn_256b_lr4e-04_shared85",
+      "name": "gen_1536d_21l_6144ffn_128b_lr3e-04_shared90",
       "model": {
         "backbone": "hybrid",
-        "d_model": 768,
-        "n_layers": 24,
-        "nhead": 12,
-        "ffn_hidden": 3072,
+        "d_model": 1536,
+        "n_layers": 21,
+        "nhead": 24,
+        "ffn_hidden": 6144,
         "patch_size": 8,
         "sr_bins": 64,
         "pos_encoding": "rope",
@@ -1055,88 +848,19 @@
         "head_layers": 1,
         "head_config": {
           "protocol": {
-            "hidden": 2368,
+            "hidden": 3328,
             "layers": 2
           },
           "modulation": {
-            "hidden": 2368,
+            "hidden": 3328,
             "layers": 2
           },
           "parameter": {
-            "hidden": 3008,
+            "hidden": 4224,
             "layers": 2
           },
           "parameter_pattern": {
-            "hidden": 3008,
-            "layers": 2
-          }
-        },
-        "use_frequency": true,
-        "layer_types": [
-          "full_attention",
-          "mla",
-          "mla"
-        ],
-        "mla_kv_lora_rank": 128,
-        "mla_q_lora_rank": 128
-      },
-      "training": {
-        "seq_len": 1024,
-        "batch_size": 256,
-        "lr": 0.0004,
-        "weight_decay": 0.05,
-        "epochs_pretrain": 200,
-        "epochs_finetune": 200,
-        "warmup_ratio": 0.1,
-        "num_workers": 4,
-        "ref_scale": 0.5,
-        "grad_clip": 1.0,
-        "seed": 42,
-        "amp": true,
-        "patience": 10,
-        "patience_pretrain": 20,
-        "eval_every": 1,
-        "log_every": 20,
-        "task_weights": {
-          "protocol": 0.3,
-          "modulation": 0.3,
-          "parameter": 0.4
-        }
-      },
-      "params_M": 268.674488,
-      "shared_ratio": 0.8491009748907273,
-      "vram_est_gb": 61.595616128
-    },
-    {
-      "name": "gen_768d_24l_3072ffn_128b_lr3e-04_shared85",
-      "model": {
-        "backbone": "hybrid",
-        "d_model": 768,
-        "n_layers": 24,
-        "nhead": 12,
-        "ffn_hidden": 3072,
-        "patch_size": 8,
-        "sr_bins": 64,
-        "pos_encoding": "rope",
-        "mask_ratio": 0.75,
-        "mae_decoder_layers": 2,
-        "head_hidden": 256,
-        "head_layers": 1,
-        "head_config": {
-          "protocol": {
-            "hidden": 2368,
-            "layers": 2
-          },
-          "modulation": {
-            "hidden": 2368,
-            "layers": 2
-          },
-          "parameter": {
-            "hidden": 3008,
-            "layers": 2
-          },
-          "parameter_pattern": {
-            "hidden": 3008,
+            "hidden": 4224,
             "layers": 2
           }
         },
@@ -1163,7 +887,7 @@
         "seed": 42,
         "amp": true,
         "patience": 10,
-        "patience_pretrain": 20,
+        "patience_pretrain": 10,
         "eval_every": 1,
         "log_every": 20,
         "task_weights": {
@@ -1172,18 +896,18 @@
           "parameter": 0.4
         }
       },
-      "params_M": 268.674488,
-      "shared_ratio": 0.8491009748907273,
-      "vram_est_gb": 34.947203968
+      "params_M": 882.687416,
+      "shared_ratio": 0.8993891003531389,
+      "vram_est_gb": 64.710534016
     },
     {
-      "name": "gen_768d_24l_3072ffn_256b_lr4e-04_shared90",
+      "name": "gen_1536d_21l_6144ffn_128b_lr3e-04_shared95",
       "model": {
         "backbone": "hybrid",
-        "d_model": 768,
-        "n_layers": 24,
-        "nhead": 12,
-        "ffn_hidden": 3072,
+        "d_model": 1536,
+        "n_layers": 21,
+        "nhead": 24,
+        "ffn_hidden": 6144,
         "patch_size": 8,
         "sr_bins": 64,
         "pos_encoding": "rope",
@@ -1193,88 +917,19 @@
         "head_layers": 1,
         "head_config": {
           "protocol": {
-            "hidden": 1792,
+            "hidden": 2112,
             "layers": 2
           },
           "modulation": {
-            "hidden": 1792,
+            "hidden": 2112,
             "layers": 2
           },
           "parameter": {
-            "hidden": 2304,
+            "hidden": 2688,
             "layers": 2
           },
           "parameter_pattern": {
-            "hidden": 2304,
-            "layers": 2
-          }
-        },
-        "use_frequency": true,
-        "layer_types": [
-          "full_attention",
-          "mla",
-          "mla"
-        ],
-        "mla_kv_lora_rank": 128,
-        "mla_q_lora_rank": 128
-      },
-      "training": {
-        "seq_len": 1024,
-        "batch_size": 256,
-        "lr": 0.0004,
-        "weight_decay": 0.05,
-        "epochs_pretrain": 200,
-        "epochs_finetune": 200,
-        "warmup_ratio": 0.1,
-        "num_workers": 4,
-        "ref_scale": 0.5,
-        "grad_clip": 1.0,
-        "seed": 42,
-        "amp": true,
-        "patience": 10,
-        "patience_pretrain": 20,
-        "eval_every": 1,
-        "log_every": 20,
-        "task_weights": {
-          "protocol": 0.3,
-          "modulation": 0.3,
-          "parameter": 0.4
-        }
-      },
-      "params_M": 254.40748,
-      "shared_ratio": 0.9005396613395547,
-      "vram_est_gb": 61.367344
-    },
-    {
-      "name": "gen_768d_24l_3072ffn_128b_lr3e-04_shared90",
-      "model": {
-        "backbone": "hybrid",
-        "d_model": 768,
-        "n_layers": 24,
-        "nhead": 12,
-        "ffn_hidden": 3072,
-        "patch_size": 8,
-        "sr_bins": 64,
-        "pos_encoding": "rope",
-        "mask_ratio": 0.75,
-        "mae_decoder_layers": 2,
-        "head_hidden": 256,
-        "head_layers": 1,
-        "head_config": {
-          "protocol": {
-            "hidden": 1792,
-            "layers": 2
-          },
-          "modulation": {
-            "hidden": 1792,
-            "layers": 2
-          },
-          "parameter": {
-            "hidden": 2304,
-            "layers": 2
-          },
-          "parameter_pattern": {
-            "hidden": 2304,
+            "hidden": 2688,
             "layers": 2
           }
         },
@@ -1301,7 +956,7 @@
         "seed": 42,
         "amp": true,
         "patience": 10,
-        "patience_pretrain": 20,
+        "patience_pretrain": 10,
         "eval_every": 1,
         "log_every": 20,
         "task_weights": {
@@ -1310,18 +965,18 @@
           "parameter": 0.4
         }
       },
-      "params_M": 254.40748,
-      "shared_ratio": 0.9005396613395547,
-      "vram_est_gb": 34.71893184
+      "params_M": 839.707,
+      "shared_ratio": 0.9499758002214187,
+      "vram_est_gb": 64.02284736
     },
     {
-      "name": "gen_768d_24l_3072ffn_256b_lr4e-04_shared95",
+      "name": "gen_1536d_24l_6144ffn_128b_lr3e-04_shared90",
       "model": {
         "backbone": "hybrid",
-        "d_model": 768,
+        "d_model": 1536,
         "n_layers": 24,
-        "nhead": 12,
-        "ffn_hidden": 3072,
+        "nhead": 24,
+        "ffn_hidden": 6144,
         "patch_size": 8,
         "sr_bins": 64,
         "pos_encoding": "rope",
@@ -1331,19 +986,19 @@
         "head_layers": 1,
         "head_config": {
           "protocol": {
-            "hidden": 1152,
+            "hidden": 3584,
             "layers": 2
           },
           "modulation": {
-            "hidden": 1152,
+            "hidden": 3584,
             "layers": 2
           },
           "parameter": {
-            "hidden": 1472,
+            "hidden": 4544,
             "layers": 2
           },
           "parameter_pattern": {
-            "hidden": 1472,
+            "hidden": 4544,
             "layers": 2
           }
         },
@@ -1358,8 +1013,8 @@
       },
       "training": {
         "seq_len": 1024,
-        "batch_size": 256,
-        "lr": 0.0004,
+        "batch_size": 128,
+        "lr": 0.000283,
         "weight_decay": 0.05,
         "epochs_pretrain": 200,
         "epochs_finetune": 200,
@@ -1370,7 +1025,7 @@
         "seed": 42,
         "amp": true,
         "patience": 10,
-        "patience_pretrain": 20,
+        "patience_pretrain": 10,
         "eval_every": 1,
         "log_every": 20,
         "task_weights": {
@@ -1379,9 +1034,78 @@
           "parameter": 0.4
         }
       },
-      "params_M": 242.061688,
-      "shared_ratio": 0.9503597645073483,
-      "vram_est_gb": 61.169811328
+      "params_M": 995.291896,
+      "shared_ratio": 0.8998198544335729,
+      "vram_est_gb": 73.053722496
+    },
+    {
+      "name": "gen_1536d_24l_6144ffn_128b_lr3e-04_shared95",
+      "model": {
+        "backbone": "hybrid",
+        "d_model": 1536,
+        "n_layers": 24,
+        "nhead": 24,
+        "ffn_hidden": 6144,
+        "patch_size": 8,
+        "sr_bins": 64,
+        "pos_encoding": "rope",
+        "mask_ratio": 0.75,
+        "mae_decoder_layers": 2,
+        "head_hidden": 256,
+        "head_layers": 1,
+        "head_config": {
+          "protocol": {
+            "hidden": 2304,
+            "layers": 2
+          },
+          "modulation": {
+            "hidden": 2304,
+            "layers": 2
+          },
+          "parameter": {
+            "hidden": 2944,
+            "layers": 2
+          },
+          "parameter_pattern": {
+            "hidden": 2944,
+            "layers": 2
+          }
+        },
+        "use_frequency": true,
+        "layer_types": [
+          "full_attention",
+          "mla",
+          "mla"
+        ],
+        "mla_kv_lora_rank": 128,
+        "mla_q_lora_rank": 128
+      },
+      "training": {
+        "seq_len": 1024,
+        "batch_size": 128,
+        "lr": 0.000283,
+        "weight_decay": 0.05,
+        "epochs_pretrain": 200,
+        "epochs_finetune": 200,
+        "warmup_ratio": 0.1,
+        "num_workers": 4,
+        "ref_scale": 0.5,
+        "grad_clip": 1.0,
+        "seed": 42,
+        "amp": true,
+        "patience": 10,
+        "patience_pretrain": 10,
+        "eval_every": 1,
+        "log_every": 20,
+        "task_weights": {
+          "protocol": 0.3,
+          "modulation": 0.3,
+          "parameter": 0.4
+        }
+      },
+      "params_M": 947.344056,
+      "shared_ratio": 0.9493091574116312,
+      "vram_est_gb": 72.286557056
     }
   ]
 }
