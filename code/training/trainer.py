@@ -291,7 +291,7 @@ class MAEPretrainer(BaseTrainer):
 
     def should_stop(self):
         # 训练 loss 连续 patience_pretrain 个 epoch 不下降即停
-        return self.bad >= self.tcfg.get("patience_pretrain", 20)
+        return self.bad >= self.tcfg.get("patience_pretrain", 10)
 
     def on_finish(self):
         export_pretrained(self.model, self.out_dir)

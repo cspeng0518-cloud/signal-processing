@@ -47,7 +47,7 @@
     "seed": 42,
     "amp": true,
     "patience": 10,
-    "patience_pretrain": 20,
+    "patience_pretrain": 10,
     "eval_every": 1,
     "log_every": 20,
     "task_weights": {
