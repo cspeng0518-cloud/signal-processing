@@ -243,10 +243,17 @@ python utils/run_grid.py --dry        # list the pending configs
 python utils/run_grid.py             # run all pending configs sequentially
 python utils/run_grid.py --only 1024d_27l   # subset by name substring
 python utils/run_grid.py --retry      # rerun configs that failed last time
+python utils/run_grid.py --nproc 16   # per-config multi-card DDP (torchrun)
 ```
 
+`--nproc auto` (default) detects all available accelerators (Ascend NPU first,
+then CUDA GPUs) and launches each config's two stages with
+`torchrun --nproc_per_node=N` — GPU uses nccl, NPU uses hccl. Note that
+`batch_size` in the grid is **per-card**; the effective total batch becomes
+`batch_size × nproc`, so scale `lr` accordingly if you raise `--nproc`.
+
 Each grid entry runs `pretrain_mae.py` then `finetune_multitask.py`
-(sequential, single GPU) with `--out_dir weights/<name>`. Per-config artifacts
+sequentially with `--out_dir weights/<name>`. Per-config artifacts
 are archived to `logs/grid_runs/<name>/` (config.json, full stage logs,
 epoch/step metrics jsonl, plots). After each config finishes, the runner reads
 its best `val_proxy_score` and manages weights globally:

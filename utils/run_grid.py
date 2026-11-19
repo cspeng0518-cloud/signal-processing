@@ -56,11 +56,37 @@ def best_score_from_metrics(jsonl_records):
     return max(scores) if scores else None
 
 
-def run_stage(stage_script, cfg_path, data_dir, out_dir, log_path, smoke_steps):
-    """跑一个训练阶段, stdout/stderr 全量落 log 文件, 返回进程返回码。"""
-    cmd = [sys.executable, str(ROOT / "code" / "training" / stage_script),
-           "--config", str(cfg_path), "--data_dir", str(data_dir),
-           "--out_dir", str(out_dir)]
+def detect_card_count():
+    """探测本机可用加速卡数（优先昇腾 NPU，其次 CUDA GPU），探测失败返回 1。"""
+    probe = ("import torch\n"
+             "n = (torch.npu.device_count() if hasattr(torch, 'npu') "
+             "and torch.npu.is_available() else torch.cuda.device_count())\n"
+             "print(max(n, 1))")
+    try:
+        out = subprocess.run([sys.executable, "-c", probe], capture_output=True,
+                             text=True, timeout=120)
+        return int(out.stdout.strip().splitlines()[-1])
+    except Exception:
+        return 1
+
+
+def run_stage(stage_script, cfg_path, data_dir, out_dir, log_path,
+              smoke_steps, nproc=1):
+    """跑一个训练阶段, stdout/stderr 全量落 log 文件, 返回进程返回码。
+
+    nproc > 1 时用 torchrun（GPU 走 nccl, 昇腾 NPU 走 hccl）拉起多卡 DDP。
+    """
+    script = str(ROOT / "code" / "training" / stage_script)
+    if nproc > 1:
+        cmd = [sys.executable, "-m", "torch.distributed.run",
+               f"--nproc_per_node={nproc}", "--standalone",
+               script,
+               "--config", str(cfg_path), "--data_dir", str(data_dir),
+               "--out_dir", str(out_dir)]
+    else:
+        cmd = [sys.executable, script,
+               "--config", str(cfg_path), "--data_dir", str(data_dir),
+               "--out_dir", str(out_dir)]
     if smoke_steps:
         cmd += ["--smoke_steps", str(smoke_steps)]
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -184,11 +210,21 @@ def main():
     ap.add_argument("--keep_weights", action="store_true",
                     help="保留每个配置的权重目录（默认只留全局最佳一组）")
     ap.add_argument("--smoke_steps", type=int, default=0, help="冒烟步数透传")
+    ap.add_argument("--nproc", default="auto",
+                    help="每组配置的训练进程数（卡数）: auto=探测全部 NPU/GPU, "
+                         "或指定整数如 16; 默认 auto")
     ap.add_argument("--dry", action="store_true", help="只列出计划, 不执行")
     args = ap.parse_args()
 
     grid = json.load(open(args.grid, encoding="utf-8"))
-    configs = grid["configs"]
+    configs = grid["configs"] if isinstance(grid, dict) else grid
+
+    nproc = (detect_card_count() if args.nproc == "auto"
+             else max(1, int(args.nproc)))
+    if nproc > 1:
+        print(f"[nproc] 每组配置 {nproc} 卡 DDP "
+              f"(batch_size 为单卡批量, 总批量 = batch_size × {nproc}; "
+              f"lr 是否随总批量放大请自行决定)")
     runs_dir = Path(args.runs_dir)
     logs_dir = ROOT / "logs"
     weights_dir = Path(args.weights_dir)
@@ -247,10 +283,10 @@ def main():
         rc = 0
         if not args.skip_pretrain:
             rc = run_stage("pretrain_mae.py", cfg_path, args.data_dir, w_run,
-                           run_dir / "pretrain.log", args.smoke_steps)
+                           run_dir / "pretrain.log", args.smoke_steps, nproc)
         if rc == 0:
             rc = run_stage("finetune_multitask.py", cfg_path, args.data_dir, w_run,
-                           run_dir / "finetune.log", args.smoke_steps)
+                           run_dir / "finetune.log", args.smoke_steps, nproc)
 
         # ---- 成绩提取 + 日志归档 ----
         fin_recs = read_jsonl(logs_dir / "finetune_metrics.jsonl")
