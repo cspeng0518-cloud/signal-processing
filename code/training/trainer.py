@@ -77,9 +77,18 @@ class BaseTrainer(ABC):
         self.optimizer = torch.optim.AdamW(
             self.train_parameters(), lr=self.tcfg["lr"],
             weight_decay=self.tcfg["weight_decay"])
+        total_steps = self.scheduler_total_steps()
+        # warmup 按 epoch 计：先由总步数换算出每 epoch 步数，再乘 warmup_epochs。
+        # 这样改 batch_size（步数变化）或改 epochs_* 都不会改变 warmup 覆盖的 epoch 数。
+        steps_per_epoch = max(1, total_steps // max(1, int(self.n_epochs())))
+        warmup_epochs = self.tcfg.get("warmup_epochs")
+        if warmup_epochs:
+            warmup_steps = int(steps_per_epoch * float(warmup_epochs))
+        else:  # 旧配置兼容：退回按总步数比例推导
+            warmup_steps = int(total_steps * self.tcfg.get("warmup_ratio", 0.1))
         self.scheduler = build_scheduler(
-            self.optimizer, self.scheduler_total_steps(),
-            self.tcfg.get("warmup_ratio", 0.1))
+            self.optimizer, total_steps, warmup_steps,
+            self.tcfg.get("min_lr_ratio", 0.01))
         # bf16 混合精度无需 loss scaling（GradScaler 仅 fp16 需要）；
         # 保留 scaler 对象以维持 optimizer_step / 断点保存接口不变（enabled=False 时透传）
         self.scaler = torch.amp.GradScaler(

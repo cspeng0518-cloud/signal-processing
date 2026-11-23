@@ -109,13 +109,23 @@ def autocast_context(device, enabled=True):
                           enabled=bool(enabled and device.type in ("cuda", "npu")))
 
 
-def build_scheduler(optimizer, total_steps, warmup_ratio=0.1):
-    warmup = int(total_steps * warmup_ratio)
+def build_scheduler(optimizer, total_steps, warmup_steps, min_lr_ratio=0.01):
+    """线性 warmup + 余弦退火（按优化步计数）。
+
+    warmup_steps 是绝对步数，由调用方按 epoch 换算（warmup_epochs × 每 epoch 步数），
+    不再用 total_steps × warmup_ratio 推导：否则改 epochs_* 会静默改变 warmup
+    覆盖的 epoch 数（50→200 epoch 时 warmup 从 5 个 epoch 变成 20 个，早停触发
+    时 lr 甚至走不完 warmup）。
+    """
+    total_steps = max(1, int(total_steps))
+    warmup = min(max(1, int(warmup_steps)), total_steps)
+
     def fn(step):
         if step < warmup:
-            return max(1e-6, (step+1)/max(1,warmup))
-        t = (step-warmup)/max(1,total_steps-warmup)
-        return max(0.01, 0.5*(1+math.cos(math.pi*min(t,1.0))))
+            return max(1e-6, (step+1)/warmup)
+        t = (step-warmup)/max(1, total_steps-warmup)
+        return max(min_lr_ratio, 0.5*(1+math.cos(math.pi*min(t,1.0))))
+
     return torch.optim.lr_scheduler.LambdaLR(optimizer, fn)
 
 
