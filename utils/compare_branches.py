@@ -16,6 +16,7 @@
   python utils/compare_branches.py --nproc 16 --sequential   # 串行各占 16 卡
   python utils/compare_branches.py --params 150 --epochs 50
   python utils/compare_branches.py --steps 300            # 冒烟模式（每 epoch 300 iter）
+  python utils/compare_branches.py --eval-only           # 不训练：用已有权重重算分数并覆盖 report
 
 产物: <repo>/logs/compare/run_<时间戳>/
   main_pretrain.log / main_finetune.log / conformer_*.log / probe_*.log
@@ -456,6 +457,93 @@ def metric_rows(branch_dir, stage):
     return len([l for l in p.read_text(encoding="utf-8").splitlines() if l.strip()])
 
 
+def print_metrics_table(metrics, title):
+    """打印两分支指标对比表（Δ 为正 = conformer 更好）。"""
+    print("\n" + "=" * 84)
+    print(title)
+    print("=" * 84)
+    all_keys = {k for k in set().union(*[set(m) for m in metrics.values()])
+                if not k.startswith("_")}
+    pref = ["test_proxy_score", "test_proxy_unified"]
+    keys = sorted(all_keys, key=lambda k: (k not in pref, k))
+    print(f"\n{'metric':<30}{'main':>14}{'conformer':>14}{'Δ(conf-main)':>16}")
+    for k in keys:
+        a, b = metrics["main"].get(k), metrics["conformer"].get(k)
+        delta = (b - a) if isinstance(a, (int, float)) and isinstance(b, (int, float)) else None
+        fmt = lambda x: "-" if x is None else (
+            f"{x:d}" if isinstance(x, int) else
+            (f"{x:.5f}" if abs(x) < 10 else f"{x:.3f}"))
+        print(f"{k:<30}{fmt(a):>14}{fmt(b):>14}"
+              f"{('-' if delta is None else f'{delta:+.5f}'):>16}")
+
+
+def latest_run_dir(repo):
+    root = repo / "logs" / "compare"
+    runs = sorted(p for p in root.glob("run_*") if p.is_dir()) if root.exists() else []
+    return runs[-1] if runs else None
+
+
+def eval_only(repo, dirs, args):
+    """不训练：加载各分支已有 weights/compare 权重重算 test 分数，覆盖 report.json。
+
+    指标实现复用各分支 training/tasks.py（已统一口径），ref_scale 固定 0.5，
+    因此旧权重也能得到与后续训练完全可比的一版分数。
+    """
+    run_dir = Path(args.run_dir).resolve() if args.run_dir else latest_run_dir(repo)
+    if run_dir is None or not run_dir.exists():
+        sys.exit("找不到 run_* 目录，请用 --run-dir 指定")
+    log(f"--eval-only 复用运行目录: {run_dir}")
+
+    script = Path(__file__).resolve().parent / "eval_test_only.py"
+    jobs = []
+    for i, name in enumerate(BRANCHES):
+        d = dirs[name]
+        w = d / "weights" / "compare"
+        weight_file = w / "model.safetensors"
+        if not weight_file.exists():
+            sys.exit(f"[{name}] 缺少权重 {weight_file}，请先跑一次训练或指定 --{name}-dir")
+        bs = int(load_json(w / "config.json")["training"].get("batch_size", 256))
+        jobs.append({
+            "branch": name, "stage": "eval",
+            "cmd": [sys.executable, str(script), "--style", name,
+                    "--branch-dir", str(d), "--weights", str(w),
+                    "--data", str(d / "datasets"), "--batch-size", str(bs),
+                    "--ref-scale", "0.5"],
+            "cwd": d, "env": accel_env(str(args.card + i)),
+            "log_path": run_dir / f"{name}_evalonly.log", "nproc": 1, "idx": i})
+
+    done = run_jobs(jobs, parallel=False)
+    metrics = {}
+    for name in BRANCHES:
+        ok, text = done[name]
+        if not ok:
+            sys.exit(f"[{name}] eval-only 失败，日志: {run_dir / f'{name}_evalonly.log'}")
+        metrics[name] = add_unified_metrics(parse_test_metrics(text))
+        if not metrics[name]:
+            sys.exit(f"[{name}] 日志里没有解析到 [test] 指标，"
+                     f"见 {run_dir / f'{name}_evalonly.log'}")
+
+    print_metrics_table(
+        metrics, "对比结果（--eval-only 用已有权重重算；test 划分，ref_scale=0.5）")
+    for name in BRANCHES:
+        log(f"[{name}] test_proxy_score={metrics[name].get('test_proxy_score', '-')} "
+            f"日志: {run_dir / f'{name}_evalonly.log'}")
+
+    report_path = run_dir / "report.json"
+    report = (json.loads(report_path.read_text(encoding="utf-8"))
+              if report_path.exists() else {})
+    report["metrics"] = metrics
+    report["eval_only"] = {
+        "at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "ref_scale": 0.5,
+        "weights": {b: str(dirs[b] / "weights" / "compare") for b in BRANCHES},
+        "logs": {b: str(run_dir / f"{b}_evalonly.log") for b in BRANCHES},
+    }
+    report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False),
+                           encoding="utf-8")
+    log(f"报告已覆盖: {report_path}")
+
+
 def collect(branch_dir, run_dir, branch):
     """把分支 metrics jsonl 和曲线图复制到本次 run 目录（worktree 可能被清）。"""
     dst = Path(run_dir) / branch
@@ -505,6 +593,11 @@ def main():
     ap.add_argument("--card", type=int, default=0, help="起始卡号")
     ap.add_argument("--port", type=int, default=29500, help="torchrun master port 基址")
     ap.add_argument("--plan-only", action="store_true")
+    ap.add_argument("--eval-only", action="store_true",
+                    help="不训练：用各分支已有 weights/compare 权重重算 test 分数，"
+                         "覆盖 run 目录里的 report.json")
+    ap.add_argument("--run-dir", default=None,
+                    help="--eval-only 复用的运行目录（默认最近一次 run_*）")
     args = ap.parse_args()
 
     repo = Path(args.repo).resolve()
@@ -542,6 +635,10 @@ def main():
     conf_dir = prepare_branch(repo, args.conformer_ref, args.conformer_dir, wt_root,
                               args.data_abs)
     dirs = {"main": main_dir, "conformer": conf_dir}
+
+    if args.eval_only:
+        eval_only(repo, dirs, args)
+        return
 
     plan = {}
     for name in BRANCHES:
@@ -658,10 +755,9 @@ def main():
         metrics[name] = add_unified_metrics(row)
         collect(d, run_dir, name)
 
-    print("\n" + "=" * 84)
-    print(f"对比结果（test 划分；同数据/同 epoch/同 batch={common_bs['finetune']}/"
-          f"同 lr={lr['finetune']:.1e}，两分支各 {args.nproc} 卡）")
-    print("=" * 84)
+    print_metrics_table(
+        metrics, f"对比结果（test 划分；同数据/同 epoch/同 batch={common_bs['finetune']}/"
+                 f"同 lr={lr['finetune']:.1e}，两分支各 {args.nproc} 卡）")
     report = {
         "created": time.strftime("%Y-%m-%d %H:%M:%S"),
         "mode": "smoke" if args.steps else "full",
@@ -673,19 +769,6 @@ def main():
         "ok": {s: {b: results[s][b] for b in BRANCHES} for s in STAGES},
         "metrics": metrics,
     }
-    all_keys = {k for k in set().union(*[set(m) for m in metrics.values()])
-                if not k.startswith("_")}
-    pref = ["test_proxy_score", "test_proxy_unified"]
-    keys = sorted(all_keys, key=lambda k: (k not in pref, k))
-    print(f"\n{'metric':<30}{'main':>14}{'conformer':>14}{'Δ(conf-main)':>16}")
-    for k in keys:
-        a, b = metrics["main"].get(k), metrics["conformer"].get(k)
-        delta = (b - a) if isinstance(a, (int, float)) and isinstance(b, (int, float)) else None
-        fmt = lambda x: "-" if x is None else (
-            f"{x:d}" if isinstance(x, int) else
-            (f"{x:.5f}" if abs(x) < 10 else f"{x:.3f}"))
-        print(f"{k:<30}{fmt(a):>14}{fmt(b):>14}"
-              f"{('-' if delta is None else f'{delta:+.5f}'):>16}")
 
     out = run_dir / "report.json"
     out.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
