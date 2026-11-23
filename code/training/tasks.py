@@ -13,7 +13,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from utils.metrics import accuracy, macro_recall, precision_score
+from utils.metrics import accuracy, macro_recall
 
 # 任务名 -> 任务模块（注册表）
 TASK_ORDER = ("protocol", "modulation", "parameter")
@@ -61,8 +61,8 @@ class ClassificationTask(BaseTaskModule):
 
 
 class ParameterTask(BaseTaskModule):
-    """参数回归任务：损失含 pattern 辅助 CE；指标用 ground-truth valid 掩码
-    （仅本地监控；官方推理由 pattern 头硬掩码，见 infer.py）。"""
+    """参数回归任务：损失含 pattern 辅助 CE；评估与 conformer 分支同一口径
+    （SI 空间 + 预测 pattern 硬掩码 + 逐参数 nRMSE，见 evaluate 文档）。"""
 
     def loss(self, model, feat, batch, cfg):
         pred = model.task_heads["parameter"](feat)
@@ -73,21 +73,46 @@ class ParameterTask(BaseTaskModule):
         return reg + cfg.get("pattern_loss_weight", 0.3) * aux
 
     def evaluate(self, model, loader, device, param_stats, ref_scale):
-        """指标在归一化 [0,1] 空间计算：ref_scale=0.5 是归一化空间的参考尺度，
-        若先用 SI 单位反归一化再算 precision，rmse 会比 ref_scale 大数百倍，
-        指标对任何非完美模型都趋近 0（SI 空间 rmse≈175 -> precision≈0.003）。
-        官方提交仍由 infer.py 输出 SI 原始单位，此处仅作模型选择监控。"""
-        gt, pred, valid = [], [], []
-        for batch, out in self._iter_outputs(model, loader, "parameter", device):
-            pred.append(out.float().cpu().numpy())
-            gt.append(batch["params"].numpy())
-            valid.append(batch["valid"].numpy())
-        y, p = np.concatenate(gt), np.concatenate(pred)
-        v = np.concatenate(valid)
-        return {
-            "precision": float(precision_score(y, p, ref_scale, valid=v)),
-            "rmse": float(np.sqrt(np.sum((y - p) ** 2 * v) / max(1, v.sum()))),
-        }
+        """SI 空间评估，与 conformer 分支逐项一致。
+
+        流程：归一化预测 -> 反归一化到 SI（裁剪到训练范围）-> 用预测 pattern
+        硬掩码（模式判错的样本该族参数预测置 0，与官方推理一致）-> 每个参数
+        计算 RMSE / 训练取值范围，7 个参数取均值得到 nrmse（无量纲）。
+        precision = 1 / (1 + nrmse / ref_scale)，对应赛题 P=1/(1+RMSE/参考尺度)
+        的同形公式；两分支 ref_scale 均取 0.5，分数可直接横向比较。
+        """
+        mn = np.asarray(param_stats["min"], dtype=np.float64)
+        mx = np.asarray(param_stats["max"], dtype=np.float64)
+        rng = np.maximum(mx - mn, 1e-12)
+        gt, pred, valid, pattern = [], [], [], []
+        model.eval()
+        with torch.inference_mode():
+            for batch in loader:
+                feat = model.encode(batch["iq"].to(device), batch["sr"].to(device))
+                gt.append(batch["params"].numpy())
+                valid.append(batch["valid"].numpy())
+                pred.append(model.task_heads["parameter"](feat).float().cpu().numpy())
+                pattern.append(
+                    model.task_heads["parameter_pattern"](feat).argmax(-1).cpu().numpy())
+        y_norm, p_norm = np.concatenate(gt), np.concatenate(pred)
+        v = np.concatenate(valid).astype(bool)
+        pat = np.concatenate(pattern)
+        # 无效维真值在归一化空间已置 0，反归一化后被 valid 掩码排除，不参与误差
+        y = y_norm * rng + mn
+        p = np.clip(p_norm * rng + mn, mn, mx)
+        keep = np.zeros_like(p)
+        keep[:, :3] = (pat == 0)[:, None]   # 预测通信：保留前 3 个参数
+        keep[:, 3:] = (pat == 1)[:, None]   # 预测雷达：保留后 4 个参数
+        p = p * keep
+        per = []
+        for j in range(y.shape[1]):
+            m = v[:, j]
+            if not m.any():
+                continue
+            per.append(np.sqrt(np.mean((p[m, j] - y[m, j]) ** 2)) / rng[j])
+        nrmse = float(np.mean(per)) if per else 0.0
+        return {"nrmse": nrmse,
+                "precision": float(1.0 / (1.0 + nrmse / ref_scale))}
 
 
 TASKS = {

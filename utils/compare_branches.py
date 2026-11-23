@@ -423,6 +423,24 @@ def parse_test_metrics(text):
     return out
 
 
+def add_unified_metrics(m):
+    """两分支已统一为同一口径（SI + 预测 pattern 掩码 + 逐参数 nRMSE + ref 0.5），
+    这里再按 nRMSE 折算一次 proxy，防止某一分支配置漏改 ref_scale 导致不可比。
+    日志里若只有归一化空间的 rmse（旧版本代码），也按同一公式兜底。"""
+    nrmse = m.get("test_parameter_nrmse")
+    if nrmse is None:
+        nrmse = m.get("test_parameter_rmse")
+    if not isinstance(nrmse, (int, float)):
+        return m
+    m["param_nrmse_unified"] = float(nrmse)
+    m["test_parameter_precision_ref05"] = 1.0 / (1.0 + float(nrmse) / 0.5)
+    acc, mod = m.get("test_protocol_acc"), m.get("test_modulation_acc")
+    if isinstance(acc, (int, float)) and isinstance(mod, (int, float)):
+        m["test_proxy_unified"] = (0.3 * acc + 0.3 * mod
+                                   + 0.4 * m["test_parameter_precision_ref05"])
+    return m
+
+
 def last_metrics(branch_dir, stage):
     p = Path(branch_dir) / "logs" / f"{stage}_metrics.jsonl"
     if not p.exists():
@@ -637,7 +655,7 @@ def main():
             row["pretrain_recon_mse"] = float(pre["recon_mse"])
         row["epochs_pretrain_done"] = metric_rows(d, "pretrain")
         row["epochs_finetune_done"] = metric_rows(d, "finetune")
-        metrics[name] = row
+        metrics[name] = add_unified_metrics(row)
         collect(d, run_dir, name)
 
     print("\n" + "=" * 84)
@@ -657,7 +675,7 @@ def main():
     }
     all_keys = {k for k in set().union(*[set(m) for m in metrics.values()])
                 if not k.startswith("_")}
-    pref = ["test_proxy_score"]
+    pref = ["test_proxy_score", "test_proxy_unified"]
     keys = sorted(all_keys, key=lambda k: (k not in pref, k))
     print(f"\n{'metric':<30}{'main':>14}{'conformer':>14}{'Δ(conf-main)':>16}")
     for k in keys:
