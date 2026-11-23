@@ -72,19 +72,58 @@ def is_oom(text):
                                 "memoryerror", "alloc_fail", "oom"))
 
 
-def accel_env(cards):
+_VIS_RE = re.compile(r"^\d+(,\d+)*$")
+
+
+def base_env():
+    """清理掉非法的 ASCEND_RT_VISIBLE_DEVICES（如 "0-7" 区间写法）。
+
+    CANN 只认逗号列表；非法值时各版本行为不一致，可能只枚举到部分卡，
+    导致 set_device 报 107001 Invalid device ID。
+    """
     env = dict(os.environ)
-    env["ASCEND_RT_VISIBLE_DEVICES"] = str(cards)
-    # torch_npu 2.x 支持该开关，老版本会直接忽略，无副作用
+    vis = env.get("ASCEND_RT_VISIBLE_DEVICES", "")
+    if vis and not _VIS_RE.match(vis.replace(" ", "")):
+        log(f"!! ASCEND_RT_VISIBLE_DEVICES={vis!r} 不是逗号列表，忽略它")
+        env.pop("ASCEND_RT_VISIBLE_DEVICES", None)
+    return env
+
+
+def accel_env(cards):
+    env = base_env()
+    # 环境里已有合法的可见卡列表就尊重它（容器/调度器分配），否则用脚本分配的卡
+    if "ASCEND_RT_VISIBLE_DEVICES" not in env:
+        env["ASCEND_RT_VISIBLE_DEVICES"] = str(cards)
     env.setdefault("PYTORCH_NPU_ALLOC_CONF", "expandable_segments:True")
     env.setdefault("OMP_NUM_THREADS", "8")
     return env
 
 
 def card_range(base, nproc, idx):
-    """并行时按分支切卡：base=0, nproc=8 -> main=0-7, conformer=8-15。"""
+    """并行时按分支切卡：base=0, nproc=8 -> main=0..7, conformer=8..15。
+
+    用逗号列表而不是 "0-7" 区间：ASCEND_RT_VISIBLE_DEVICES 对区间语法的
+    支持随 CANN 版本而异，逗号列表全版本可靠。
+    """
     start = int(base) + idx * nproc
-    return str(start) if nproc == 1 else f"{start}-{start + nproc - 1}"
+    return ",".join(str(i) for i in range(start, start + nproc))
+
+
+def detect_npus():
+    """当前环境可见的 NPU 数量（None = 检测失败）。"""
+    r = subprocess.run(
+        [sys.executable, "-c",
+         "import torch, torch_npu; print(torch.npu.device_count())"],
+        text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        env=base_env())
+    if r.returncode != 0:
+        tail = (r.stderr or "").strip().splitlines()
+        log(f"!! NPU 检测失败: {tail[-1] if tail else 'unknown'}")
+        return None
+    try:
+        return int(r.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        return None
 
 
 def load_json(path):
@@ -456,9 +495,27 @@ def main():
     wt_root = repo.parent / "signal_compare_wt"
     args.n_layers = sorted(set(args.n_layers))
     args.ffn_hidden = sorted(set(args.ffn_hidden))
-    if args.parallel and len(BRANCHES) * args.nproc > 16:
-        log(f"!! 并行 {len(BRANCHES)}×{args.nproc} 卡超出 16 卡，改为串行")
-        args.parallel = False
+    vis = os.environ.get("ASCEND_RT_VISIBLE_DEVICES")
+    total = detect_npus()
+    if total is not None:
+        log(f"可见 NPU: {total} 张" + (f"（ASCEND_RT_VISIBLE_DEVICES={vis}）" if vis else ""))
+        if total <= 0:
+            sys.exit("未检测到可用 NPU，请检查 npu-smi info / 容器卡分配")
+        if total < args.nproc:
+            log(f"  提示: 本 shell 只看到 {total} 张卡。若机器确实有更多卡，"
+                f"请执行 unset ASCEND_RT_VISIBLE_DEVICES 后重跑")
+        if args.nproc > total:
+            log(f"!! --nproc {args.nproc} 超过可见卡数 {total}，自动改为 {total}")
+            args.nproc = total
+        if args.parallel and len(BRANCHES) * args.nproc > total:
+            log(f"!! 并行需要 {len(BRANCHES) * args.nproc} 卡，可见只有 {total}，改为串行")
+            args.parallel = False
+        if vis and args.parallel:
+            log("!! 环境已设 ASCEND_RT_VISIBLE_DEVICES，脚本无法再切分卡，改为串行")
+            args.parallel = False
+    else:
+        log(f"!! 未检测到 NPU 数量，按 --nproc={args.nproc} 继续；"
+            f"若报 Invalid device ID 请检查 npu-smi info / ASCEND_RT_VISIBLE_DEVICES")
     if args.steps and not args.epochs:
         args.epochs = 1  # 冒烟默认 1 epoch，warmup/调度才有实际形状
 
@@ -529,11 +586,11 @@ def main():
                     break
                 log(f"[{name}/{s}] bs={bs} OOM，降到 {bs // 2}")
                 bs = max(8, bs // 2)
-            item.setdefault("bs_verified", {})[s] = bs if ok else item["bs"][s]
             if not ok:
-                log(f"!! [{name}/{s}] 探针失败且非显存问题，请查 {j['log_path']}；"
-                    f"沿用估算 batch，正式跑大概率同样失败")
-            log(f"[{name}/{s}] 实测可用 per-card batch = {item['bs_verified'][s]}")
+                hint = "显存不足（bs 已降到 8）" if is_oom(text) else "非显存错误"
+                sys.exit(f"[{name}/{s}] 探针失败：{hint}，停止。日志: {j['log_path']}")
+            item.setdefault("bs_verified", {})[s] = bs
+            log(f"[{name}/{s}] 实测可用 per-card batch = {bs}")
 
     common_bs = {s: min(plan[b]["bs_verified"][s] for b in BRANCHES) for s in STAGES}
     lr = {s: scaled_lr(common_bs[s], args.nproc, args.lr) for s in STAGES}
