@@ -157,12 +157,37 @@ def run_jobs(jobs, parallel):
 # ---------------------------------------------------------------------------
 # 分支准备
 # ---------------------------------------------------------------------------
+def checked_out_path(repo, ref):
+    """返回 ref 已被 git 检出的目录（没有则 None）。
+
+    主分支通常就在 repo 根目录检出，不能再 `git worktree add main`，
+    直接复用现有目录即可。
+    """
+    r = subprocess.run(["git", "-C", str(repo), "worktree", "list", "--porcelain"],
+                       text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    cur = None
+    for line in r.stdout.splitlines():
+        if line.startswith("worktree "):
+            cur = Path(line[len("worktree "):].strip())
+        elif line.startswith("branch "):
+            branch = line[len("branch "):].strip().replace("refs/heads/", "")
+            if branch == ref:
+                return cur
+    return None
+
+
 def prepare_branch(repo, ref, given_dir, wt_root, data_dir):
     if given_dir:
         d = Path(given_dir).resolve()
         if not (d / "utils" / "gen_configs.py").exists():
             sys.exit(f"目录不像项目根（缺 utils/gen_configs.py）: {d}")
         return d
+
+    found = checked_out_path(repo, ref)
+    if found:
+        log(f"  {ref} 已在 {found} 检出，直接复用（不新建 worktree）")
+        link_data(found, data_dir)
+        return found.resolve()
 
     wt_root.mkdir(parents=True, exist_ok=True)
     d = wt_root / ref
