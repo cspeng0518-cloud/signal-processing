@@ -507,7 +507,7 @@ def eval_only(repo, dirs, args):
             "branch": name, "stage": "eval",
             "cmd": [sys.executable, str(script), "--style", name,
                     "--branch-dir", str(d), "--weights", str(w),
-                    "--data", str(d / "datasets"), "--batch-size", str(bs),
+                    "--data", str(args.data_abs), "--batch-size", str(bs),
                     "--ref-scale", "0.5"],
             "cwd": d, "env": accel_env(str(args.card + i)),
             "log_path": run_dir / f"{name}_evalonly.log", "nproc": 1, "idx": i})
@@ -516,12 +516,16 @@ def eval_only(repo, dirs, args):
     metrics = {}
     for name in BRANCHES:
         ok, text = done[name]
+        log_path = run_dir / f"{name}_evalonly.log"
         if not ok:
-            sys.exit(f"[{name}] eval-only 失败，日志: {run_dir / f'{name}_evalonly.log'}")
+            for line in (text or "").splitlines()[-20:]:
+                print(f"     {line}", flush=True)
+            sys.exit(f"[{name}] eval-only 失败，日志: {log_path}")
         metrics[name] = add_unified_metrics(parse_test_metrics(text))
         if not metrics[name]:
-            sys.exit(f"[{name}] 日志里没有解析到 [test] 指标，"
-                     f"见 {run_dir / f'{name}_evalonly.log'}")
+            for line in (text or "").splitlines()[-20:]:
+                print(f"     {line}", flush=True)
+            sys.exit(f"[{name}] 没有解析到 [test] 指标（多为 test 划分缺失），日志: {log_path}")
 
     print_metrics_table(
         metrics, "对比结果（--eval-only 用已有权重重算；test 划分，ref_scale=0.5）")

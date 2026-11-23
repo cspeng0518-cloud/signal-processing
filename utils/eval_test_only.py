@@ -84,6 +84,9 @@ def main():
         res = {t: TASKS[t].evaluate(model, loaders["test"][t], device, stats, a.ref_scale)
                for t in TASK_ORDER if t in loaders.get("test", {})}
 
+    if not res:
+        print(f"[test] no test split under {a.data}", flush=True)
+        sys.exit(2)
     for t, m in res.items():
         print(f"[test] {t}: "
               + str({k: round(float(v), 6) for k, v in m.items()}), flush=True)
