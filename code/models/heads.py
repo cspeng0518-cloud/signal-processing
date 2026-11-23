@@ -1,55 +1,94 @@
-"""任务头（多任务适配，对应赛题任务2）
+"""任务头（对应赛题任务 2：基座模型多任务适配）
 
-架构原则：三个任务共享同一 backbone（权重共用 >80%），
-每个任务只挂一个轻量 head（参数占比 <20%）：
-  - SystemHead:    体制识别 8 类
-  - ModulationHead: 调制识别 23 类
-  - ParameterHead:  7 参数联合回归（多输出结构，参考 EMind RPE 多任务回归头）
-
-统一从 CLS token 表征（backbone 输出第 0 个位置）读取全局特征。
+统一表征 -> 任务语义映射的三层设计（主干 100% 共享，只有以下部分任务私有）:
+  1) 任务提示（task prompt，见 tokenizer.py）：CLS 叠加任务嵌入，同一共享主干
+     按任务"调焦"，主干权重 100% 共享；
+  2) 任务专属注意力池化 AttnPool：每个任务用自己的可学习 query 在全部 token
+     （时域/频谱/星座/统计）上做注意力读出，再与 CLS 拼接——不同任务关注不同视角
+     （调制看星座+高阶谱，参数看包络 ACF+时域沿，体制看频谱占用），
+     而参数量只有 O(d)；
+  3) 轻量 MLP 输出层；调制额外挂"调制族"辅助头（PSK/QAM/FSK/模拟/雷达 5 类，
+     层次化监督）与可选 SupCon 投影头；参数头 = pattern 分类 + 回归/离散分类混合输出。
 """
 
 import torch
 import torch.nn as nn
 
 
-def _mlp(d_in, hidden, d_out, hidden_layers=1, dropout=0.1):
-    """可配深度 MLP: 输入投影 + (hidden_layers-1) 个 hidden 块 + 输出投影。"""
-    layers = [nn.Linear(d_in, hidden), nn.GELU(), nn.Dropout(dropout)]
-    for _ in range(max(0, hidden_layers - 1)):
-        layers += [nn.Linear(hidden, hidden), nn.GELU(), nn.Dropout(dropout)]
-    layers.append(nn.Linear(hidden, d_out))
-    return nn.Sequential(*layers)
+def trunk(d_in, hidden, layers=1, dropout=0.1):
+    """layers 个 (Linear -> GELU -> Dropout) 块，输出维 hidden（末端已激活）。"""
+    mods, d = [], d_in
+    for _ in range(max(1, layers)):
+        mods += [nn.Linear(d, hidden), nn.GELU(), nn.Dropout(dropout)]
+        d = hidden
+    return nn.Sequential(*mods)
 
 
-class ClassificationHead(nn.Module):
-    """轻量分类头：CLS -> MLP -> logits（hidden_layers>1 时加深）"""
+class AttnPool(nn.Module):
+    """多头注意力池化：h 个头各一个可学习 query，key 为 LN(x)，value 为 x 按头切分。"""
 
-    def __init__(self, d_model=128, n_classes=8, hidden=256, dropout=0.1,
-                 hidden_layers=1):
+    def __init__(self, d, nhead=4):
         super().__init__()
-        self.net = _mlp(d_model, hidden, n_classes, hidden_layers, dropout)
+        assert d % nhead == 0
+        self.h, self.dh = nhead, d // nhead
+        self.ln = nn.LayerNorm(d)
+        self.q = nn.Parameter(torch.randn(nhead, self.dh) * 0.02)
 
-    def forward(self, ctx):
-        return self.net(ctx[:, 0])  # CLS token 位置
+    def forward(self, x, pad_mask=None):
+        B, L, D = x.shape
+        k = self.ln(x).view(B, L, self.h, self.dh)
+        score = torch.einsum("blhd,hd->bhl", k, self.q.to(k.dtype)) / self.dh ** 0.5
+        if pad_mask is not None:
+            score = score.masked_fill(pad_mask[:, None, :], float("-inf"))
+        a = score.float().softmax(-1).to(x.dtype)                      # [B,h,L]
+        v = x.view(B, L, self.h, self.dh)
+        return torch.einsum("bhl,blhd->bhd", a, v).reshape(B, D)
 
 
-class RegressionHead(nn.Module):
-    """多输出回归头：一次联合回归 7 个物理参数（EMind 式多任务回归）
+class PooledFeature(nn.Module):
+    """CLS ⊕ AttnPool -> [B, 2d]"""
 
-    输出经 sigmoid 映射到 [0,1]，训练前对参数做 min-max 归一化，
-    推理时再反归一化回原始量纲（官方要求输出原始单位）。
-    hidden_layers>1 时可加深（parameter 任务重，允许单独加容量）。
-    """
-
-    def __init__(self, d_model=128, n_params=7, hidden=256, dropout=0.1,
-                 hidden_layers=1):
+    def __init__(self, d, nhead=4):
         super().__init__()
-        self.net = nn.Sequential(
-            _mlp(d_model, hidden, n_params, hidden_layers, dropout),
-            nn.Sigmoid(),  # 归一化参数空间 [0,1]
-        )
-        self.n_params = n_params
+        self.pool = AttnPool(d, nhead)
 
-    def forward(self, ctx):
-        return self.net(ctx[:, 0])  # [B, n_params]，范围 [0,1]
+    def forward(self, ctx, pad_mask=None):
+        return torch.cat([ctx[:, 0], self.pool(ctx, pad_mask)], dim=-1)
+
+
+class ClsHead(nn.Module):
+    def __init__(self, d, n_classes, hidden=512, layers=1, dropout=0.1, pool_heads=4,
+                 n_aux=0, proj_dim=0):
+        super().__init__()
+        self.feat = PooledFeature(d, pool_heads)
+        self.trunk = trunk(2 * d, hidden, layers, dropout)
+        self.out = nn.Linear(hidden, n_classes)
+        self.aux = nn.Linear(hidden, n_aux) if n_aux else None
+        self.proj = nn.Sequential(nn.Linear(hidden, hidden), nn.GELU(),
+                                  nn.Linear(hidden, proj_dim)) if proj_dim else None
+
+    def forward(self, ctx, pad_mask=None, return_all=False):
+        h = self.trunk(self.feat(ctx, pad_mask))
+        logits = self.out(h)
+        if not return_all:
+            return logits
+        return {"logits": logits, "hidden": h,
+                "aux": self.aux(h) if self.aux is not None else None,
+                "proj": self.proj(h) if self.proj is not None else None}
+
+
+class ParamHead(nn.Module):
+    """参数头：pattern(通信/雷达) 2 类 + 回归 n_reg 维 + 每个离散参数一个分类输出。"""
+
+    def __init__(self, d, n_reg, cls_sizes, hidden=512, layers=2, dropout=0.1, pool_heads=4):
+        super().__init__()
+        self.feat = PooledFeature(d, pool_heads)
+        self.trunk = trunk(2 * d, hidden, layers, dropout)
+        self.pattern = nn.Linear(hidden, 2)
+        self.reg = nn.Linear(hidden, n_reg)
+        self.cls = nn.ModuleList([nn.Linear(hidden, c) for c in cls_sizes])
+
+    def forward(self, ctx, pad_mask=None):
+        h = self.trunk(self.feat(ctx, pad_mask))
+        return {"pattern": self.pattern(h), "reg": self.reg(h),
+                "cls": [c(h) for c in self.cls]}

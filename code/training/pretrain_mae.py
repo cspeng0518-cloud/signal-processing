@@ -1,12 +1,12 @@
-"""阶段一：MAE 自监督预训练（任务无关，全部任务训练数据混用）。
+"""阶段一：MAE 自监督预训练（三任务训练数据混用，任务无关）。
 
 用法:
-  python training/pretrain_mae.py --data_dir <dir> [--config ...] [--resume ...]     # 单卡
-  torchrun --nproc_per_node=N training/pretrain_mae.py --data_dir <dir> [...]        # 多卡
+  python code/training/pretrain_mae.py --data_dir datasets --out_dir weights          # 单卡
+  torchrun --nproc_per_node=N code/training/pretrain_mae.py --data_dir datasets        # 多卡
+  python code/training/pretrain_mae.py --smoke_steps 2                                # 冒烟
 
-本文件只负责：参数/配置/数据组装 -> MAEPretrainer.fit()。
-训练生命周期（调度/断点/日志/导出）见 training/trainer.py，
-任务损失/评估的多态实现见 training/tasks.py。
+产出: weights/mae_pretrained.pt（val 重建损失最佳时刷新）、weights/mae_resume.pt（断点）
+主干: FA + MLA 混合（只编码约 25% 可见 token，省显存）；Conformer neck 不参与预训练。
 """
 
 import sys
@@ -15,74 +15,71 @@ from pathlib import Path
 CODE_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(CODE_ROOT))
 
-from torch.utils.data import ConcatDataset, DataLoader, Dataset
-from torch.utils.data.distributed import DistributedSampler
+import torch                                                     # noqa: E402
+from torch.utils.data import ConcatDataset                       # noqa: E402
 
-from models import EMFoundation
-from training.common import ROOT, base_arg_parser, load_config
-from training.trainer import MAEPretrainer
-from utils.dataset import make_task_dataset
-from utils.logger import get_logger
-from utils.train_utils import get_device, init_distributed, seed_all, teardown_distributed
-
-# 预训练混用全部任务的训练集（任务无关）
-PRETRAIN_TASKS = ("protocol", "modulation", "parameter")
+from models import build_model                                   # noqa: E402
+from training.common import ROOT, base_arg_parser, load_config   # noqa: E402
+from training.trainer import MAEPretrainer                       # noqa: E402
+from utils.dataset import TASKS, make_loader, make_task_dataset  # noqa: E402
+from utils.logger import get_logger                              # noqa: E402
+from utils.train_utils import (get_device, init_distributed, seed_all,  # noqa: E402
+                               teardown_distributed)
 
 
-class UnlabeledIQ(Dataset):
-    """无标签 IQ 包装（MAE 只需 iq/sr）。"""
-
-    def __init__(self, ds):
-        self.ds = ds
-
-    def __len__(self):
-        return len(self.ds)
-
-    def __getitem__(self, i):
-        return self.ds[i]["iq"], self.ds[i]["sr"]
+def collate_iq(batch):
+    """预训练只需要 iq（三任务样本字段不同，不能用任务 collate）。"""
+    return {"iq": torch.stack([b["iq"] for b in batch])}
 
 
-def build_pretrain_loader(data_dir, cfg, device, logger, rank=0, world_size=1):
-    """合并各任务训练集 -> 无标签 loader（多卡时 DistributedSampler 分片）。"""
-    datasets, n_total = [], 0
-    for t in PRETRAIN_TASKS:
-        try:
-            ds = make_task_dataset(data_dir, t, "train")
-        except FileNotFoundError:
-            logger.info("skip %s (no train split)", t)
+def build_pretrain_loaders(data_dir, tc, logger, rank=0, world_size=1):
+    """train: 三任务 train 划分合并 + 长度分桶；val: 三任务 val 划分合并（早停用）。"""
+    out = {}
+    for split in ("train", "val"):
+        dss = []
+        for t in TASKS:
+            try:
+                ds = make_task_dataset(data_dir, t, split, seq_len=tc.get("seq_len", 1024))
+            except FileNotFoundError:
+                continue
+            dss.append(ds)
+            logger.info("pretrain %s: %s -> %d samples", split, t, len(ds))
+        if not dss:
+            if split == "train":
+                raise FileNotFoundError(f"no training data under {data_dir}; "
+                                        "run `python utils/prepare_official.py` first")
+            out[split] = None
             continue
-        datasets.append(ds)
-        n_total += len(ds)
-        logger.info("pretrain: %s -> %d samples", t, len(ds))
-    if not datasets:
-        raise FileNotFoundError(
-            f"no training data under {data_dir}; run `python utils/prepare_official.py` "
-            f"first (produces datasets/<task>/iq.memap + meta.json), or check --data_dir")
-    merged = UnlabeledIQ(ConcatDataset(datasets))
-    sampler = (DistributedSampler(merged, num_replicas=world_size, rank=rank,
-                                  shuffle=True)
-               if world_size > 1 else None)
-    return DataLoader(
-        merged,
-        batch_size=cfg["batch_size"], shuffle=(sampler is None), sampler=sampler,
-        drop_last=True, num_workers=cfg.get("num_workers", 0),
-        pin_memory=(device.type == "cuda"), persistent_workers=False)
+        train = split == "train"
+        bs = tc["batch_size"] if train else tc.get("eval_batch_size", tc["batch_size"])
+        out[split] = make_loader(ConcatDataset(dss), bs, train, tc.get("num_workers", 4),
+                                 bucket=tc.get("length_bucketing", True), collate=collate_iq,
+                                 seed=tc.get("seed", 42), rank=rank, world_size=world_size)
+    return out["train"], out["val"]
 
 
 def main():
     args = base_arg_parser("MAE self-supervised pretraining").parse_args()
     cfg = load_config(args.config)
-    seed_all(cfg["training"].get("seed", 42))  # 各卡同 seed：初始化一致 + 梯度平均 => 权重同步
+    tc = cfg["training"]
+    tc["lr"] = tc.get("lr_pretrain", tc["lr"])
+    tc["batch_size"] = tc.get("batch_size_pretrain", tc["batch_size"])
+
+    seed_all(tc.get("seed", 42))           # 各卡同 seed：初始化一致 + 梯度平均 => 权重同步
     device, rank, world_size, is_main = init_distributed()
     if device is None:
         device = get_device()
     logger = get_logger("pretrain", ROOT / "logs", quiet=not is_main)
 
-    loader = build_pretrain_loader(args.data_dir, cfg["training"], device, logger,
-                                   rank, world_size)
-    model = EMFoundation(cfg["model"]).to(device)
+    model = build_model(cfg["model"], with_decoder=True).to(device)
+    loader, val_loader = build_pretrain_loaders(args.data_dir, tc, logger, rank, world_size)
+    dec = sum(p.numel() for p in model.mae_decoder.parameters())
+    logger.info("device=%s world_size=%d deploy_params=%.2fM mae_decoder=%.2fM "
+                "shared_ratio=%.4f backbone=%s", device, world_size,
+                model.deploy_parameter_count() / 1e6, dec / 1e6, model.shared_ratio(),
+                model.backbone.layer_types)
     MAEPretrainer(cfg, model, device, logger, out_dir=args.out_dir, loader=loader,
-                  resume=args.resume, smoke_steps=args.smoke_steps,
+                  val_loader=val_loader, resume=args.resume, smoke_steps=args.smoke_steps,
                   rank=rank, world_size=world_size).fit()
     teardown_distributed()
 

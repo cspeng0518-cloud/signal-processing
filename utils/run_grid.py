@@ -16,7 +16,7 @@
 
 全局产物:
   weights/best/          历史最佳一组权重（model.safetensors + config.json +
-                         param_stats.json, 官方推理格式）——非最佳配置的权重训完即清理
+                         param_codec.json, 官方推理格式）——非最佳配置的权重训完即清理
   logs/grid_runs/best.json          最佳配置汇总（名称/得分/完整配置条目）
   logs/grid_runs/state.json         批量进度（断点续跑: done 的自动跳过）
   logs/grid_runs/summary.jsonl      每配置一行成绩流水
@@ -122,7 +122,7 @@ def update_best(best_json_path, best_dir, name, score, entry, weights_run_dir):
     if best_dir.exists():
         shutil.rmtree(best_dir)
     best_dir.mkdir(parents=True)
-    for f in ("model.safetensors", "config.json", "param_stats.json"):
+    for f in ("model.safetensors", "config.json", "param_codec.json"):
         src = weights_run_dir / f
         if src.exists():
             shutil.copy2(src, best_dir / f)

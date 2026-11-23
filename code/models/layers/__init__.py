@@ -1,22 +1,28 @@
-"""通用网络层子包（与赛题任务无关的可插拔组件，参考 sglang layers/ 组织）
+"""通用网络层子包（与赛题任务无关的可插拔组件）
 
-  attention.py   注意力组件（RoPE / Full / MLA）+ RMSNorm（纯 torch 原生实现）
-  gated_delta.py Gated DeltaNet 门控增量线性注意力（纯 torch 原生递归）
-  mamba.py       Mamba 选择性状态空间 block（纯 torch 原生 selective scan）
-  hybrid.py      混合层体系（BaseSequenceLayer 及其子类）+ build_sequence_layer 工厂
+  attention.py   RoPE 表 / 多头注意力(FA) / MLA / 跨域注意力 / SwiGLU / RMSNorm / DropPath
+                 （注意力核心统一走 models/ops/fused.attention -> SDPA / NPU 融合算子）
+  conformer.py   Conformer block（微调 neck 使用）
+  gated_delta.py Gated DeltaNet 门控增量线性注意力（可选层类型）
+  mamba.py       Mamba 选择性状态空间 block（可选层类型）
+  hybrid.py      统一层契约 BaseSequenceLayer + build_sequence_layer 工厂
 
-backbone（编码器级类层次与工厂）位于 models/backbone.py 顶层；
-赛题相关模块（foundation / tokenizer / heads / frequency）同样在 models/ 顶层。
+编码器（HybridEncoder，主干与 neck 共用同一个类）位于 models/backbone.py。
 """
 
-from .attention import (RoPEAttention, FullAttention, MLAAttention,
-                        RoPEEncoderLayer, RMSNorm)
+from .attention import (CrossAttention, DropPath, MLAAttention, MultiHeadAttention,
+                        RMSNorm, RoPEPositionalEncoding, SwiGLU)
+from .conformer import ConformerLayer, ConvModule
 from .gated_delta import GatedDeltaAttention
+from .hybrid import (CONTIGUOUS_ONLY, LAYER_TYPES, AttentionLayer, BaseSequenceLayer,
+                     GatedDeltaLayer, MambaLayer, build_sequence_layer,
+                     normalize_layer_type)
 from .mamba import MambaBlock
-from .hybrid import BaseSequenceLayer, build_sequence_layer, LAYER_TYPES, normalize_layer_type
 
 __all__ = [
-    "RoPEAttention", "FullAttention", "MLAAttention", "RoPEEncoderLayer", "RMSNorm",
+    "CrossAttention", "DropPath", "MLAAttention", "MultiHeadAttention", "RMSNorm",
+    "RoPEPositionalEncoding", "SwiGLU", "ConformerLayer", "ConvModule",
     "GatedDeltaAttention", "MambaBlock",
-    "BaseSequenceLayer", "build_sequence_layer", "LAYER_TYPES", "normalize_layer_type",
+    "CONTIGUOUS_ONLY", "LAYER_TYPES", "AttentionLayer", "BaseSequenceLayer",
+    "GatedDeltaLayer", "MambaLayer", "build_sequence_layer", "normalize_layer_type",
 ]

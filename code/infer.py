@@ -2,19 +2,28 @@
 
 官方要求:
   - 位于 $HOME/code/infer.py
-  - 输入: test Parquet（官方 sample_io 仅 task/sample_id/iq 3 列，混合三任务）
+  - 输入: test Parquet（task / sample_id / iq 3 列，混合三任务，512/1024 两种长度）
   - 输出: JSONL，每行 {task, sample_id, prediction}，顺序与输入行序一致
-    分类: prediction 为字符串（官方精确类别名）
+    分类: prediction 为官方类别名字符串
     参数: prediction 为 {参数名: 数值}（SI 原始单位，不适用参数填 0.0）
 
+推理优化（复赛“计算效率提升度”按推理时延排名）:
+  1. 按 (task, 原始长度) 分组成批：512 点样本只跑 64 个时域 token，批内无 padding mask
+     -> SDPA 可走 FlashAttention 内核
+  2. 默认 bf16 autocast（信号前端内部强制 fp32，精度不受影响）
+  3. 可选 --compile（torch.compile 主干，CUDA）
+  4. 预热 + 计时：日志输出解析/模型耗时、每样本耗时、吞吐，以及融合算子启用状态
+
 用法:
-    python code/infer.py --input datasets/01/rf_signal_sample_io_v1.0/rf_signal_sample_io_input_v1.0.parquet --output out/pred.jsonl
+  python code/infer.py --input test.parquet --output out/pred.jsonl
+  python code/infer.py --input test.parquet --output out/pred.jsonl --precision fp32 --batch_size 256
 """
 
+import argparse
+import json
 import os
 import sys
-import json
-import argparse
+import time
 
 import numpy as np
 import pandas as pd
@@ -23,90 +32,106 @@ import torch
 ROOT = os.path.abspath(os.path.dirname(__file__))  # code/
 sys.path.insert(0, ROOT)
 
-from models import EMFoundation
-from training.common import load_config  # 归一化新旧配置格式 -> {"model","training"}
-from utils.dataset import to_iq_array, PARAM_NAMES, ID2LABEL, FS
-from utils.logger import get_logger
+from models import build_model                                  # noqa: E402
+from training.common import load_config                         # noqa: E402
+from utils.dataset import ID2LABEL, PARAM_NAMES, to_iq_array   # noqa: E402
+from utils.logger import get_logger                             # noqa: E402
+from utils.param_codec import ParamCodec                        # noqa: E402
 
 
 def load_model(weights_dir, device):
-    """加载 weights/ 下的 model.safetensors + config.json + param_stats.json"""
-    cfg = load_config(os.path.join(weights_dir, "config.json"))
-    model = EMFoundation(cfg["model"]).to(device)
+    """加载 weights/ 下 config.json + model.safetensors（+ param_codec），返回 (model, cfg)。"""
     from safetensors.torch import load_file
+    cfg = load_config(os.path.join(weights_dir, "config.json"))
+    model = build_model(cfg["model"], with_decoder=False).to(device)
     sd = load_file(os.path.join(weights_dir, "model.safetensors"))
     sd = {(k[len("model."):] if k.startswith("model.") else k): v for k, v in sd.items()}
-    model.load_state_dict(sd)
+    missing, unexpected = model.load_state_dict(sd, strict=False)
+    if missing or unexpected:
+        raise RuntimeError(f"权重与配置不匹配: missing={missing[:5]} unexpected={unexpected[:5]}")
+    spec = cfg["model"].get("param_codec")
+    model.codec = ParamCodec(spec) if spec else \
+        ParamCodec.load(os.path.join(weights_dir, "param_codec.json"))
     model.eval()
+    return model, cfg
 
-    stats_path = os.path.join(weights_dir, "param_stats.json")
-    if os.path.exists(stats_path):
-        with open(stats_path, "r", encoding="utf-8") as f:
-            s = json.load(f)
-        param_stats = {"min": np.array(s["min"], dtype=np.float32),
-                       "max": np.array(s["max"], dtype=np.float32)}
-    else:
-        param_stats = None
-    return model, cfg, param_stats
+
+def _autocast(device, precision):
+    if precision == "fp32" or device.type not in ("cuda", "npu"):
+        return torch.autocast(device_type=device.type, enabled=False)
+    dt = torch.bfloat16 if precision == "bf16" else torch.float16
+    return torch.autocast(device_type=device.type, dtype=dt)
+
+
+def _sync(device):
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    elif device.type == "npu":
+        torch.npu.synchronize()
+
+
+def _predict(model, iq, task):
+    out = model.predict(iq, task)
+    return out.float().cpu().numpy() if task == "parameter" else out.cpu().numpy()
 
 
 @torch.no_grad()
-def infer_file(model, parquet_path, out_path, seq_len, param_stats, device, batch_size=32):
-    """官方输入（混合三任务，行序任意混排）-> JSONL。
-
-    批内按 task 分组前向；输出严格保持输入行序（与官方 expected_output 对齐）。
-    parameter 样本由 parameter_pattern 头决定模式：
-      通信(前3参有效) -> 后4参填 0.0；雷达(后4参有效) -> 前3参填 0.0
-    """
+def infer_file(model, parquet_path, out_path, seq_len, device, batch_size=256,
+               precision="bf16", logger=None, warmup=True):
+    """官方输入（混合三任务，行序任意）-> JSONL（严格保持输入行序）。"""
     df = pd.read_parquet(parquet_path, columns=["task", "sample_id", "iq"])
     df["task"] = df["task"].replace({"system": "protocol"})
-    if not set(df["task"]).issubset({"protocol","modulation","parameter"}):
-        raise ValueError(f"unknown tasks: {set(df['task'])}")
-    out_dir = os.path.dirname(os.path.abspath(out_path))
-    os.makedirs(out_dir, exist_ok=True)
+    unknown = set(df["task"]) - {"protocol", "modulation", "parameter"}
+    if unknown:
+        raise ValueError(f"unknown tasks: {unknown}")
+    os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
 
-    # 结果按全局行号存放，最后顺序写出
+    t0 = time.perf_counter()
+    raw = [to_iq_array(v) for v in df["iq"]]
+    lengths = [min(len(a), seq_len) for a in raw]
+    iqs = [to_iq_array(a, seq_len) for a in raw]
+    del raw
+    t_parse = time.perf_counter() - t0
+
+    groups = {}
+    for i, (t, ln) in enumerate(zip(df["task"].to_numpy(), lengths)):
+        groups.setdefault((t, int(ln)), []).append(i)
+
+    if warmup and len(df):
+        k = next(iter(groups))
+        x = torch.from_numpy(np.stack([iqs[i] for i in groups[k][:4]])).to(device)
+        with _autocast(device, precision):
+            _predict(model, x, k[0])
+        _sync(device)
+
     results = [None] * len(df)
-    for s in range(0, len(df), batch_size):
-        chunk = df.iloc[s : s + batch_size]
-        # 同批内按 task 分组前向（批内行序不再要求一致）
-        for task, idx in chunk.groupby("task").indices.items():
-            rows = chunk.iloc[idx]
-            iqs = [to_iq_array(v, seq_len) for v in rows["iq"]]
-            iq = torch.from_numpy(np.stack(iqs)).to(device)
-            sr = torch.full((len(rows),), FS, dtype=torch.float32, device=device)
-
-            out = model(iq, sr, task)
-            if task == "parameter":
-                # pattern 头 -> 模式硬掩码（官方 expected 输出不适用项 = 0.0）
-                pat = model(iq, sr, "parameter_pattern").argmax(-1)  # [B] 0=通信 1=雷达
-                mask = torch.zeros_like(out)
-                mask[:, :3] = (pat == 0).float().unsqueeze(-1)
-                mask[:, 3:] = (pat == 1).float().unsqueeze(-1)
-                pred = out.cpu().numpy()
-                if param_stats is not None:
-                    pred = pred * (param_stats["max"] - param_stats["min"]) + param_stats["min"]
-                pred = pred * mask.cpu().numpy()  # 必须先反归一化后清零
-                for j, (_, row) in enumerate(rows.iterrows()):
-                    results[s + int(idx[j])] = {
-                        "task": task,
-                        "sample_id": row["sample_id"],
-                        "prediction": {n: float(pred[j, k])
-                                       for k, n in enumerate(PARAM_NAMES)},
-                    }
-            else:
-                ids = out.argmax(-1).cpu().numpy()
-                for j, (_, row) in enumerate(rows.iterrows()):
-                    results[s + int(idx[j])] = {
-                        "task": task,
-                        "sample_id": row["sample_id"],
-                        "prediction": ID2LABEL[task][int(ids[j])],
-                    }
+    sids = df["sample_id"].to_numpy()
+    t1 = time.perf_counter()
+    for (task, _), idx_all in groups.items():
+        for s in range(0, len(idx_all), batch_size):
+            idx = idx_all[s:s + batch_size]
+            x = torch.from_numpy(np.stack([iqs[i] for i in idx])).to(device, non_blocking=True)
+            with _autocast(device, precision):
+                pred = _predict(model, x, task)
+            for j, i in enumerate(idx):
+                if task == "parameter":
+                    p = {n: float(pred[j, k]) for k, n in enumerate(PARAM_NAMES)}
+                else:
+                    p = ID2LABEL[task][int(pred[j])]
+                results[i] = {"task": task, "sample_id": str(sids[i]), "prediction": p}
+    _sync(device)
+    t_model = time.perf_counter() - t1
 
     with open(out_path, "w", encoding="utf-8") as fout:
         for r in results:
             fout.write(json.dumps(r, ensure_ascii=False) + "\n")
-    print(f"[infer] {parquet_path} -> {out_path} ({len(df)} samples)")
+    msg = (f"[infer] {parquet_path} -> {out_path} n={len(df)} parse_s={t_parse:.3f} "
+           f"model_s={t_model:.3f} per_sample_ms={1000 * t_model / max(1, len(df)):.4f} "
+           f"throughput={len(df) / max(t_model, 1e-9):.1f}/s precision={precision}")
+    print(msg)
+    if logger:
+        logger.info(msg)
+    return results
 
 
 def main():
@@ -114,19 +139,28 @@ def main():
     parser.add_argument("--input", required=True, help="测试 Parquet 文件路径")
     parser.add_argument("--output", required=True, help="输出 JSONL 路径")
     parser.add_argument("--weights_dir", default=os.path.join(ROOT, "..", "weights"))
-    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--batch_size", type=int, default=256)
+    parser.add_argument("--precision", default="bf16", choices=["bf16", "fp16", "fp32"])
+    parser.add_argument("--compile", action="store_true", help="torch.compile 主干（CUDA）")
     args = parser.parse_args()
 
     from utils.train_utils import get_device
     device = get_device()
-    model, cfg, param_stats = load_model(args.weights_dir, device)
-    import time
-    logger = get_logger("inference", os.path.join(ROOT,"..","logs"), "inference.log")
+    logger = get_logger("inference", os.path.join(ROOT, "..", "logs"), "inference.log")
+    model, cfg = load_model(args.weights_dir, device)
+    if args.compile and device.type == "cuda":
+        model.backbone = torch.compile(model.backbone, dynamic=True)
     start = time.perf_counter()
-    infer_file(model, args.input, args.output,
-               seq_len=cfg["training"].get("seq_len", 1024), param_stats=param_stats,
-               device=device, batch_size=args.batch_size)
-    logger.info("device=%s input=%s output=%s elapsed_s=%.3f",device,args.input,args.output,time.perf_counter()-start)
+    infer_file(model, args.input, args.output, seq_len=cfg["model"].get(
+        "seq_len", cfg["training"].get("seq_len", 1024)), device=device,
+        batch_size=args.batch_size, precision=args.precision, logger=logger)
+    try:
+        from models.ops import fused_status
+        logger.info("fused ops: %s", fused_status())
+    except Exception:
+        pass
+    logger.info("device=%s params=%.2fM elapsed_total_s=%.3f", device,
+                model.deploy_parameter_count() / 1e6, time.perf_counter() - start)
 
 
 if __name__ == "__main__":

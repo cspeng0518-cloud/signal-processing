@@ -1,152 +1,116 @@
-"""IQ Tokenizer（参考 EMind V-A 节）
+"""时域流 Tokenizer（时-频双流中的“时域流”，对应赛题任务 1）
 
-将连续 IQ 序列离散化为 patch token 序列：
-  1. [N,2] IQ -> 按 patch_size 切块（每块 patch_size 个复数点）
-  2. 线性嵌入到 d_model 维 token
-  3. 序列前插入两个特殊 token（仅靠位置编码区分功能）：
-     - [CLS] 分类 token：输出全局表征，供任务头使用
-     - [SR]  采样率 token：携带采样率元信息，预训练时永不掩码
-  4. 附带幅度归一化 IQ_hat = IQ / max(|IQ|)（保物理能量分布）
+输入为信号前端（models/dsp.py, SignalFrontEnd）的输出 dict，输出 token 序列:
+
+    [CLS] [STAT] [TIME_1 .. TIME_P]
+      |      |          |
+    全局读出  16 维统计量  多通道卷积 stem（I,Q,校正后 I/Q,包络,瞬时频率）
+    (+任务提示)          ⊕ 门控融合的同帧 STFT 谱（通道级时-频对齐融合）
+
+  * 位置信息：不叠加绝对位置编码，由主干 RoPE 按 token 下标旋转 q/k
+    （前缀占位置 0、1，时域 token 从 2 开始）；MAE 只编码可见 token 时传原始下标。
+  * 通道级融合：时域 patch token 与同一时刻的 STFT 帧（帧移 = patch，一一对齐）
+    做逐 token、逐通道门控 t' = LN(t + σ(W[t; s]) ⊙ s)。门控初始偏向时域。
+  * 任务提示（task prompt）：CLS 叠加任务嵌入（任务私有参数，计入 head 参数量）。
 """
 
-import math
 import torch
 import torch.nn as nn
 
-# 位置编码缓存长度上限对应的假设信号长度上限（token 最大长度 = 4096/patch_size + 2）
-MAX_SIGNAL_LEN = 4096
+from .dsp import N_STATS
+
+N_PREFIX = 2                                   # [CLS] + [STAT]
+TASK_IDS = {"protocol": 0, "modulation": 1, "parameter": 2}
 
 
-def token_max_len(patch_size):
-    """token 序列最大长度（含 CLS/SR 两个特殊位），sin/rope 共用。"""
-    return MAX_SIGNAL_LEN // patch_size + 2
+class ConvStem(nn.Module):
+    """早期卷积 stem（Xiao et al. 2021, "Early convolutions help transformers see better"）。
 
-
-class IQTokenizer(nn.Module):
-    def __init__(self, d_model=128, patch_size=8, sr_bins=64, pos_encoding="sin"):
-        """
-        Args:
-            d_model: token 维度
-            patch_size: 每个patch包含的复数采样点数（EMind: 8）
-            sr_bins: 采样率分桶数（采样率跨kHz~MHz，分桶嵌入）
-            pos_encoding: 位置编码类型，"sin"（可加性正弦，tokenizer 内叠加）
-                          或 "rope"（旋转位置编码，由 backbone 注意力实现，
-                          tokenizer 不叠加任何位置向量）
-        """
-        super().__init__()
-        self.d_model = d_model
-        self.patch_size = patch_size
-        # 每个 patch: patch_size 个复数点 * 2 通道(I/Q) = 2*patch_size 维实数
-        self.patch_embed = nn.Linear(2 * patch_size, d_model)
-        # 特殊 token
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
-        self.sr_embed = nn.Linear(1, d_model)  # 采样率标量 -> token
-        self.sr_bins = sr_bins
-        # 位置编码："sin" 时为可加性模块；"rope" 时为 None（位置由注意力携带）
-        self.pos_encoding_type = pos_encoding
-        if pos_encoding == "sin":
-            self.pos_encoding = SinPositionalEncoding(
-                d_model, max_len=token_max_len(patch_size))
-        elif pos_encoding == "rope":
-            self.pos_encoding = None
-        else:
-            raise ValueError(f"未知 pos_encoding: {pos_encoding}，可选 'sin' | 'rope'")
-        nn.init.trunc_normal_(self.cls_token, std=0.02)
-
-    @staticmethod
-    def normalize(iq):
-        """幅度归一化 IQ_hat = IQ / max(|IQ|)，返回值域约 [-1,1] 的 [B,N,2]"""
-        amp = torch.sqrt(iq[..., 0] ** 2 + iq[..., 1] ** 2 + 1e-8)  # [B,N]
-        max_amp = amp.max(dim=-1, keepdim=True).values.unsqueeze(-1)  # [B,1,1]
-        return iq / max_amp
-
-    def to_patches(self, iq):
-        """[B,N,2] -> [B, n_patch, 2*patch_size]（N 非 patch 整数倍时右侧截断）"""
-        B, N, _ = iq.shape
-        n_patch = N // self.patch_size
-        iq = iq[:, : n_patch * self.patch_size, :]
-        # [B, n_patch, patch_size, 2] -> [B, n_patch, 2*patch_size]
-        return iq.reshape(B, n_patch, self.patch_size, 2).reshape(B, n_patch, -1)
-
-    def forward(self, iq, sr):
-        """
-        Args:
-            iq: [B, N, 2] 原始 IQ
-            sr: [B] 采样率（Hz）
-        Returns:
-            tokens: [B, 2+n_patch, d_model]（[CLS]+[SR]+patch tokens）
-            n_patch: patch 数
-        """
-        iq = self.normalize(iq)
-        patches = self.to_patches(iq)                    # [B,P,D]
-        patch_tokens = self.patch_embed(patches)         # [B,P,D]
-
-        B = iq.size(0)
-        cls = self.cls_token.expand(B, -1, -1)           # [B,1,D]
-        # 采样率嵌入（log 压缩 kHz~MHz 跨度）
-        sr_tok = self.sr_embed(torch.log10(sr).unsqueeze(-1).unsqueeze(-1))  # [B,1,1]->[B,1,D]
-
-        tokens = torch.cat([cls, sr_tok, patch_tokens], dim=1)  # [B,P+2,D]
-        if self.pos_encoding is not None:  # rope 模式无叠加，位置由 backbone 携带
-            tokens = self.pos_encoding(tokens)
-        return tokens, patch_tokens.size(1)
-
-
-class SinPositionalEncoding(nn.Module):
-    def __init__(self, d_model, max_len=500):
-        super().__init__()
-        pe = torch.zeros(max_len, d_model)
-        pos = torch.arange(0, max_len).unsqueeze(1).float()
-        div = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
-        pe[:, 0::2] = torch.sin(pos * div)
-        if d_model > 1:
-            pe[:, 1::2] = torch.cos(pos * div[: (d_model - 1) // 2 + 1])
-        self.register_buffer("pe", pe.unsqueeze(0))
-
-    def forward(self, x):  # [B,L,D]
-        return x + self.pe[:, : x.size(1)]
-
-
-class RoPEPositionalEncoding(nn.Module):
-    """RoPE 旋转位置编码（与 SinPositionalEncoding 并列的可选方案）。
-
-    区别于可加性正弦编码：RoPE 不在 token 上叠加位置向量，而是持有
-    cos/sin 旋转表，由注意力的 q/k 调用 rotate() 按相对位置旋转。
-
-    优点：
-      - gather/丢弃 token 后仍可用原始下标作位置（MAE 加速路径友好）
-      - 相对位置建模与更好的长度外推性
-
-    Args:
-        d_model/nhead: 共同决定 head_dim = d_model // nhead（须为偶数）
-        max_len: 位置表长度上限（token 序列最大长度，含 CLS/SR）
+    [B,C,N] -> [B,N/patch,d]，总步长 = patch；比单层线性 patch embedding 保留更多
+    patch 内的细粒度结构（符号跳变、脉冲前后沿——time_delay 只有几个采样点量级）。
     """
 
-    def __init__(self, d_model, nhead, max_len=500, base=10000.0):
+    STRIDES = {4: (2, 2), 8: (2, 4), 16: (4, 4)}
+
+    def __init__(self, c_in, d, patch=8, width=64):
         super().__init__()
-        head_dim = d_model // nhead
-        if head_dim % 2 != 0:
-            raise ValueError(f"RoPE requires even head_dim, got d_model={d_model}, nhead={nhead}")
-        inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2).float() / head_dim))
-        t = torch.arange(max_len).float()
-        freqs = torch.outer(t, inv_freq)             # [max_len, head_dim/2]
-        emb = torch.cat([freqs, freqs], dim=-1)      # [max_len, head_dim]（前后两半配对）
-        self.register_buffer("cos", emb.cos().unsqueeze(0))  # [1, max_len, head_dim]
-        self.register_buffer("sin", emb.sin().unsqueeze(0))
+        if patch not in self.STRIDES:
+            raise ValueError(f"patch_size 仅支持 {sorted(self.STRIDES)}，当前 {patch}")
+        s1, s2 = self.STRIDES[patch]
+        self.net = nn.Sequential(
+            nn.Conv1d(c_in, width, 7, padding=3), nn.GELU(),
+            nn.Conv1d(width, 2 * width, 2 * s1 + 1, stride=s1, padding=s1), nn.GELU(),
+            nn.Conv1d(2 * width, d, s2, stride=s2),
+        )
+        self.norm = nn.LayerNorm(d)
 
-    def rotate(self, x, pos_ids=None):
-        """对注意力的 q/k 施加旋转。
+    def forward(self, x):
+        return self.norm(self.net(x).transpose(1, 2))
 
-        Args:
-            x:      [B, L, H, head_dim]
-            pos_ids: [B, L] token 原始下标（gather 后保持真实位置）；None 用 0..L-1
-        """
-        if pos_ids is None:
-            cos = self.cos[:, : x.size(1)].unsqueeze(2)       # [1, L, 1, Dh]
-            sin = self.sin[:, : x.size(1)].unsqueeze(2)
+
+class GatedChannelFusion(nn.Module):
+    """通道级动态对齐融合：t' = LN(t + σ(W[t; s]) ⊙ s)。"""
+
+    def __init__(self, d):
+        super().__init__()
+        self.gate = nn.Linear(2 * d, d)
+        self.norm = nn.LayerNorm(d)
+        self.reset_gate()
+
+    def reset_gate(self):
+        nn.init.zeros_(self.gate.weight)
+        nn.init.constant_(self.gate.bias, -1.0)     # 初始偏向时域，训练中逐步打开 STFT 支路
+
+    def forward(self, t, s):
+        g = torch.sigmoid(self.gate(torch.cat([t, s], dim=-1)))
+        return self.norm(t + g * s)
+
+
+class TimeTokenizer(nn.Module):
+    def __init__(self, d_model=512, patch_size=8, stft_win=32, stem_width=64,
+                 n_time_channels=6, use_stft=True, use_stats=True, task_prompt=True):
+        super().__init__()
+        self.patch = patch_size
+        self.use_stft = use_stft
+        self.use_stats = use_stats
+        self.task_prompt = task_prompt
+        self.stem = ConvStem(n_time_channels, d_model, patch_size, stem_width)
+        if use_stft:
+            self.stft_proj = nn.Sequential(nn.Linear(stft_win, d_model), nn.LayerNorm(d_model))
+            self.fuse = GatedChannelFusion(d_model)
+        if use_stats:
+            self.stat_proj = nn.Sequential(nn.Linear(N_STATS, d_model), nn.GELU(),
+                                           nn.Linear(d_model, d_model), nn.LayerNorm(d_model))
         else:
-            cos = self.cos.squeeze(0)[pos_ids].unsqueeze(2)   # [B, L, 1, Dh]
-            sin = self.sin.squeeze(0)[pos_ids].unsqueeze(2)
-        cos, sin = cos.to(x.dtype), sin.to(x.dtype)           # AMP 下与 q/k 同精度
-        x1, x2 = x.chunk(2, dim=-1)
-        return x * cos + torch.cat([-x2, x1], dim=-1) * sin
+            self.stat_token = nn.Parameter(torch.zeros(1, 1, d_model))
+            nn.init.trunc_normal_(self.stat_token, std=0.02)
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
+        nn.init.trunc_normal_(self.cls_token, std=0.02)
+        if task_prompt:
+            self.task_embed = nn.Embedding(len(TASK_IDS), d_model)
+            nn.init.normal_(self.task_embed.weight, std=0.02)
+
+    def private_parameters(self):
+        """任务私有参数（task prompt），参数核算时计入 head。"""
+        return list(self.task_embed.parameters()) if self.task_prompt else []
+
+    def forward(self, fe, task=None):
+        """
+        Args:
+            fe:   SignalFrontEnd 输出 dict
+            task: 任务名（str）或 None（预训练）
+        Returns:
+            prefix [B,2,d]（CLS, STAT），time [B,P,d]（P = seq_len/patch，未裁剪）
+        """
+        t = self.stem(fe["time_ch"].to(self.cls_token.dtype))               # [B,P,d]
+        if self.use_stft:
+            t = self.fuse(t, self.stft_proj(fe["stft"]))
+        B = t.size(0)
+        cls = self.cls_token.expand(B, -1, -1)
+        if self.task_prompt and task is not None:
+            cls = cls + self.task_embed.weight[TASK_IDS[task]]
+        if self.use_stats:
+            stat = self.stat_proj(fe["stats"]).unsqueeze(1)
+        else:
+            stat = self.stat_token.expand(B, -1, -1)
+        return torch.cat([cls, stat.to(cls.dtype)], dim=1), t

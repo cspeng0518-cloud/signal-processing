@@ -1,5 +1,4 @@
 """可复现训练通用组件。"""
-import math
 import os
 import random
 import numpy as np
@@ -52,19 +51,45 @@ def teardown_distributed():
         dist.destroy_process_group()
 
 
-def all_reduce_grads(model, world_size):
-    """手动梯度同步：逐参数 all-reduce 求和后取平均。
+def all_reduce_grads(model, world_size, bucket_mb=32):
+    """手动梯度同步：按 dtype 分桶拼平后 all-reduce 求平均（替代逐参数 all-reduce）。
 
-    不用 DDP 封装的原因：模型有 forward_mae / encode 等多个自定义前向入口，
-    且 MAE 预训练时任务头不参与反传（DDP 需开 find_unused_parameters）。
-    各卡同 seed 初始化 + 梯度平均，保证权重始终同步。
+    不用 DDP 封装的原因：模型有 forward_pretrain / head_outputs 等多个自定义前向入口，
+    且预训练时任务头不参与反传。各卡同 seed 初始化 + 梯度平均 => 权重始终同步。
+    分桶（默认 32MB）把上千次小通信合并为几十次，16 卡 HCCL/NCCL 下显著提速。
     """
     if world_size < 2:
         return
+    from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
+    limit = bucket_mb * 1024 * 1024
+    buckets, cur, cur_bytes, cur_dtype = [], [], 0, None
     for p in model.parameters():
-        if p.grad is not None:
-            dist.all_reduce(p.grad)
-            p.grad.div_(world_size)
+        if p.grad is None:
+            continue
+        g = p.grad
+        nbytes = g.numel() * g.element_size()
+        if cur and (g.dtype != cur_dtype or cur_bytes + nbytes > limit):
+            buckets.append(cur)
+            cur, cur_bytes = [], 0
+        cur.append(g)
+        cur_bytes += nbytes
+        cur_dtype = g.dtype
+    if cur:
+        buckets.append(cur)
+    for grads in buckets:
+        flat = _flatten_dense_tensors(grads)
+        dist.all_reduce(flat)
+        flat.div_(world_size)
+        for g, synced in zip(grads, _unflatten_dense_tensors(flat, grads)):
+            g.copy_(synced)
+
+
+def all_reduce_sum(t, world_size):
+    """张量 all-reduce 求和（单卡直接返回）。评估用：混淆矩阵 / 误差平方和精确汇总。"""
+    if world_size < 2:
+        return t
+    dist.all_reduce(t)
+    return t
 
 
 def broadcast_flag(flag, device, world_size):
@@ -76,30 +101,6 @@ def broadcast_flag(flag, device, world_size):
     return bool(t.item())
 
 
-def all_reduce_mean(metrics, count, device, world_size):
-    """多卡分片评估的指标汇总：按各卡样本数加权平均。
-
-    - acc / precision 等比率指标：必须按 Σ(metric_r × n_r) / Σn_r 加权合并，
-      比率直接相加再除总数会把指标缩小 world/total 倍（16 卡 val acc 曾因此
-      从 0.94 被错误汇总成 0.001）
-    - rmse：在平方域加权合并（Σ(rmse_r² × n_r) / Σn_r 再开方），可精确还原全量 rmse
-    - macro_recall：分片近似（strided 分片类别分布均匀，误差可忽略，仅监控用）
-    all-reduce 的归约结果在各卡完全一致，best/早停等决策各卡独立计算也不分歧。
-    """
-    if world_size < 2:
-        return metrics
-    keys = sorted(metrics)
-    # count 为本卡分片样本数：比率先乘本卡样本数转为"可加量"，归约后再除总数
-    vals = [metrics[k] * metrics[k] * count if k == "rmse"
-            else metrics[k] * count for k in keys]
-    t = torch.tensor(vals + [float(count)], dtype=torch.float32, device=device)
-    dist.all_reduce(t)
-    total = max(1.0, t[-1].item())
-    return {k: (math.sqrt(t[i].item() / total) if k == "rmse"
-                else t[i].item() / total)
-            for i, k in enumerate(keys)}
-
-
 def autocast_context(device, enabled=True):
     """bf16 混合精度 autocast（预训练后量化友好，无 CUDA 专有算子）。
 
@@ -109,37 +110,21 @@ def autocast_context(device, enabled=True):
                           enabled=bool(enabled and device.type in ("cuda", "npu")))
 
 
-def build_scheduler(optimizer, total_steps, warmup_steps, min_lr_ratio=0.01):
-    """线性 warmup + 余弦退火（按优化步计数）。
-
-    warmup_steps 是绝对步数，由调用方按 epoch 换算（warmup_epochs × 每 epoch 步数），
-    不再用 total_steps × warmup_ratio 推导：否则改 epochs_* 会静默改变 warmup
-    覆盖的 epoch 数（50→200 epoch 时 warmup 从 5 个 epoch 变成 20 个，早停触发
-    时 lr 甚至走不完 warmup）。
-    """
-    total_steps = max(1, int(total_steps))
-    warmup = min(max(1, int(warmup_steps)), total_steps)
-
-    def fn(step):
-        if step < warmup:
-            return max(1e-6, (step+1)/warmup)
-        t = (step-warmup)/max(1, total_steps-warmup)
-        return max(min_lr_ratio, 0.5*(1+math.cos(math.pi*min(t,1.0))))
-
-    return torch.optim.lr_scheduler.LambdaLR(optimizer, fn)
-
-
-def optimizer_step(loss, optimizer, model, scaler, clip, world_size=1):
+def optimizer_step(loss, optimizer, model, clip, world_size=1, params=None):
     """反向 + 多卡梯度同步 + 裁剪 + 优化器步进，返回裁剪前的全局梯度范数。
 
-    多卡时在 unscale 之后、裁剪之前做梯度 all-reduce（平均），各卡看到
-    完全一致的梯度，权重更新保持同步。
+    bf16 autocast 动态范围与 fp32 同阶，无需 GradScaler（已移除 fp16 loss scaling 分支）。
     """
     optimizer.zero_grad(set_to_none=True)
-    scaler.scale(loss).backward()
-    scaler.unscale_(optimizer)
+    loss.backward()
+    return clip_and_step(optimizer, model, clip, world_size, params)
+
+
+def clip_and_step(optimizer, model, clip, world_size=1, params=None):
+    """梯度已就位后：多卡同步 -> 裁剪 -> step，返回裁剪前梯度范数。"""
     all_reduce_grads(model, world_size)
-    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
-    scaler.step(optimizer)
-    scaler.update()
+    params = params if params is not None else [p for p in model.parameters()
+                                                if p.grad is not None]
+    grad_norm = torch.nn.utils.clip_grad_norm_(params, clip)
+    optimizer.step()
     return float(grad_norm)

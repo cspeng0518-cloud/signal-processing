@@ -1,13 +1,14 @@
-"""阶段二：单 backbone 多任务微调（protocol / modulation / parameter）。
+"""阶段二：单一共享基座多任务微调（protocol / modulation / parameter 联合训练）。
 
 用法:
-  python training/finetune_multitask.py --data_dir <dir> [--from_mae ...]      # 单卡
-                                       [--config ...] [--resume ...] [--eval_test]
-  torchrun --nproc_per_node=N training/finetune_multitask.py --data_dir <dir> [...]  # 多卡
+  python code/training/finetune_multitask.py --data_dir datasets --out_dir weights [--eval_test]
+  torchrun --nproc_per_node=N code/training/finetune_multitask.py --data_dir datasets
+  python code/training/finetune_multitask.py --smoke_steps 2                         # 冒烟
 
-本文件只负责：参数/配置/数据组装 -> 多任务微调 -> fit()。
-训练生命周期（调度/断点/早停/评估/导出）见 training/trainer.py，
-任务损失/评估的多态实现见 training/tasks.py。
+流程: 拟合/加载 ParamCodec -> 构建模型（无 MAE 解码器）-> 加载 mae_pretrained.pt 共享权重
+      （主干 FA/MLA + 双流 tokenizer + 融合；Conformer neck 与任务头随机初始化）
+      -> 赛题红线校验 -> MultitaskFinetuner.fit() -> 可选 test 无偏评估
+产出: weights/config.json + model.safetensors + param_codec.json（官方推理格式）
 """
 
 import sys
@@ -16,53 +17,66 @@ from pathlib import Path
 CODE_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(CODE_ROOT))
 
-from models import EMFoundation
-from training.common import ROOT, base_arg_parser, load_config, load_mae_pretrained
-from training.tasks import TASK_ORDER, TASKS
-from training.trainer import MultitaskFinetuner
-from utils.dataset import build_task_dataloaders
-from utils.logger import get_logger
-from utils.train_utils import get_device, init_distributed, seed_all, teardown_distributed
+import torch.distributed as dist                                              # noqa: E402
 
-MAX_TOTAL_PARAMS = 1_000_000_000   # 赛题红线：总参数量 < 1B
-MIN_SHARED_RATIO = 0.80            # 赛题红线：权重共用率 > 80%
-
-
-def assert_competition_limits(model):
-    """赛题红线校验，返回 (shared_ratio, total_params)。"""
-    shared_ratio, total = model.shared_ratio(), \
-        sum(p.numel() for p in model.parameters())
-    if total >= MAX_TOTAL_PARAMS:
-        raise ValueError(f"总参数量 {total} 超过 1B 红线")
-    if shared_ratio <= MIN_SHARED_RATIO:
-        raise ValueError(f"权重共用率 {shared_ratio:.2%} 未达 80% 红线")
-    return shared_ratio, total
+from models import build_model                                                # noqa: E402
+from training.common import (ROOT, assert_competition_limits, base_arg_parser,  # noqa: E402
+                             load_config, load_mae_pretrained)
+from training.tasks import TASK_ORDER, TASKS, proxy_score                     # noqa: E402
+from training.trainer import MultitaskFinetuner                               # noqa: E402
+from utils.dataset import build_task_dataloaders, load_param_arrays           # noqa: E402
+from utils.logger import get_logger                                           # noqa: E402
+from utils.param_codec import ParamCodec                                      # noqa: E402
+from utils.train_utils import (autocast_context, get_device, init_distributed,  # noqa: E402
+                               seed_all, teardown_distributed)
 
 
-def evaluate_on_test(model, data_dir, train_cfg, param_stats, device, logger, out_dir):
-    """在 test 划分上做无偏评估（加载导出的 best 权重）。
+def prepare_codec(args, tc, logger, is_main):
+    """参数编解码器：out_dir 已有则复用（保证续训/推理一致），否则在 train 划分上拟合。"""
+    path = Path(args.out_dir) / "param_codec.json"
+    reuse = path.exists() and not args.refit_codec
+    if dist.is_initialized():
+        dist.barrier()                     # 各卡先统一判定是否复用，再由主卡写文件（防读到半写文件）
+    if reuse:
+        codec = ParamCodec.load(path)
+        logger.info("loaded param codec: %s", path)
+    else:
+        try:
+            p, v = load_param_arrays(args.data_dir, "train", tc.get("seq_len", 1024))
+            cc = tc.get("codec", {})
+            codec = ParamCodec.fit(p, v, max_classes=cc.get("max_classes", 32),
+                                   log_ratio=cc.get("log_ratio", 20.0), force=cc.get("force"),
+                                   decode=cc.get("decode", "expectation"))
+            logger.info("fitted param codec on %d train samples", len(p))
+        except FileNotFoundError:
+            codec = ParamCodec.default()
+            logger.warning("no parameter train data found; using default codec")
+        if is_main:
+            Path(args.out_dir).mkdir(parents=True, exist_ok=True)
+            codec.save(path)
+    logger.info("param codec:\n%s", codec.describe())
+    return codec
 
-    test 从未参与训练/早停/导出决策，其指标是官方隐藏测试集出分前
-    最可信的本地水位参考；频繁查看 test 会引入选择偏差，只在此处用一次。
-    """
+
+def evaluate_on_test(trainer, data_dir, logger):
+    """用导出的 best 权重在 test 划分上做一次无偏评估（test 从不参与训练期决策）。"""
     from safetensors.torch import load_file
-    best_path = Path(out_dir) / "model.safetensors"
-    model.load_state_dict(load_file(str(best_path)))
-    logger.info("[test] loaded best weights: %s", best_path)
-    loaders, _ = build_task_dataloaders(
-        data_dir, batch_size=train_cfg["batch_size"], seq_len=train_cfg["seq_len"],
-        splits=("test",), num_workers=train_cfg.get("num_workers", 0))
-    results = {t: TASKS[t].evaluate(model, loaders["test"][t], device, param_stats,
-                                    train_cfg.get("ref_scale", 0.5))
-               for t in TASK_ORDER if t in loaders["test"]}
-    for t, m in results.items():
-        logger.info("[test] %s: %s", t, {k: round(v, 5) for k, v in m.items()})
-    score = (0.3 * results["protocol"]["acc"]
-             + 0.3 * results["modulation"]["acc"]
-             + 0.4 * results["parameter"]["precision"])
-    logger.info("[test] proxy score=%.5f (unbiased; val best was the model-selection "
-                "criterion, test was never seen during training)", score)
-    return score
+    model = trainer.eval_model()
+    sd = load_file(str(trainer.out_dir / "model.safetensors"))
+    model.load_state_dict(sd, strict=False)
+    tc = trainer.tcfg
+    loaders = build_task_dataloaders(data_dir, seq_len=tc.get("seq_len", 1024),
+                                     splits=("test",), num_workers=tc.get("num_workers", 4),
+                                     eval_batch_size=tc.get("eval_batch_size", 1024))
+    if len(loaders["test"]) < len(TASK_ORDER):
+        logger.warning("[test] test split incomplete, skipped")
+        return
+    res = {}
+    with autocast_context(trainer.device, tc.get("amp", True)):
+        for t in TASK_ORDER:
+            res[t] = TASKS[t].evaluate(model, loaders["test"][t], trainer.device, tc)
+            logger.info("[test] %s: %s", t, {k: round(v, 6) for k, v in res[t].items()})
+    logger.info("[test] proxy score=%.5f", proxy_score(res, tc.get("score_weights")))
 
 
 def main():
@@ -71,42 +85,51 @@ def main():
                         help="MAE 预训练权重路径（默认: out_dir/mae_pretrained.pt）")
     parser.add_argument("--eval_test", action="store_true",
                         help="训练结束后在 test 划分上无偏评估（加载导出的 best 权重）")
+    parser.add_argument("--refit_codec", action="store_true",
+                        help="强制重新拟合 param_codec.json（数据划分变化后使用）")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
-    train_cfg = cfg["training"]
-    seed_all(train_cfg.get("seed", 42))  # 各卡同 seed：初始化一致 + 梯度平均 => 权重同步
+    tc = cfg["training"]
+    tc["lr"] = tc.get("lr_finetune", tc["lr"])
+    tc["batch_size"] = tc.get("batch_size_finetune", tc["batch_size"])
+
+    seed_all(tc.get("seed", 42))
     device, rank, world_size, is_main = init_distributed()
     if device is None:
         device = get_device()
     logger = get_logger("finetune", ROOT / "logs", quiet=not is_main)
 
-    # ---- 数据（多卡时 train/val 均分片：train 训练、val 并行评估汇总；test 仅主卡） ----
-    loaders, param_stats = build_task_dataloaders(
-        args.data_dir, batch_size=train_cfg["batch_size"], seq_len=train_cfg["seq_len"],
-        num_workers=train_cfg.get("num_workers", 0), rank=rank, world_size=world_size)
+    codec = prepare_codec(args, tc, logger, is_main)
+    cfg["model"]["param_head_spec"] = codec.head_spec()
+    cfg["model"]["param_codec"] = codec.spec
+
+    loaders = build_task_dataloaders(
+        args.data_dir, batch_size=tc["batch_size"], seq_len=tc.get("seq_len", 1024),
+        num_workers=tc.get("num_workers", 4), bucket=tc.get("length_bucketing", True),
+        eval_batch_size=tc.get("eval_batch_size", 1024), rank=rank, world_size=world_size,
+        seed=tc.get("seed", 42))
     missing = [t for t in TASK_ORDER if t not in loaders["train"]]
     if missing:
         raise RuntimeError(f"missing required train tasks: {missing}")
 
-    # ---- 模型 ----
-    model = EMFoundation(cfg["model"]).to(device)
+    model = build_model(cfg["model"], with_decoder=False).to(device)
+    model.codec = codec
     shared, total = assert_competition_limits(model)
-    logger.info("device=%s shared_ratio=%.2f%% params=%d", device, shared * 100, total)
+    logger.info("device=%s world_size=%d params=%.2fM shared_ratio=%.2f%% backbone=%s neck=%s",
+                device, world_size, total / 1e6, shared * 100, model.backbone.layer_types,
+                model.neck.layer_types if model.neck is not None else None)
 
-    if not args.resume:  # resume 时继续原权重，不重复加载 MAE 初始化
-        mae_path = args.from_mae or str(Path(args.out_dir) / "mae_pretrained.pt")
-        load_mae_pretrained(model, mae_path, logger)
+    if not args.resume:                    # 续训时沿用断点权重，不重复加载 MAE 初始化
+        load_mae_pretrained(model, args.from_mae or str(Path(args.out_dir) / "mae_pretrained.pt"),
+                            logger)
 
-    MultitaskFinetuner(cfg, model, device, logger, out_dir=args.out_dir,
-                       loaders=loaders, param_stats=param_stats,
-                       resume=args.resume, smoke_steps=args.smoke_steps,
-                       rank=rank, world_size=world_size).fit()
-
-    # test 无偏评估单进程足够（主卡做，各卡权重同步结果一致）
+    trainer = MultitaskFinetuner(cfg, model, device, logger, out_dir=args.out_dir,
+                                 loaders=loaders, codec=codec, resume=args.resume,
+                                 smoke_steps=args.smoke_steps, rank=rank, world_size=world_size)
+    trainer.fit()
     if args.eval_test and is_main:
-        evaluate_on_test(model, args.data_dir, train_cfg, param_stats,
-                         device, logger, args.out_dir)
+        evaluate_on_test(trainer, args.data_dir, logger)
     teardown_distributed()
 
 

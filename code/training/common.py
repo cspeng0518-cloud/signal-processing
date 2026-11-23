@@ -1,10 +1,11 @@
-"""两阶段训练脚本（pretrain_mae / finetune_multitask）共享的脚手架：
+"""两阶段训练脚本共享的脚手架
 
-  - base_arg_parser:   统一命令行参数
-  - normalize_config:  新旧配置格式归一化 -> {"model": ..., "training": ...}
-  - load_config:       读取 JSON 配置（自动归一化）
-  - load_mae_pretrained: 加载 MAE 预训练共享权重（微调用）
-  - ROOT / CODE_ROOT: 目录常量
+  - base_arg_parser:     统一命令行参数
+  - normalize_config:    配置格式归一化 -> {"model": ..., "training": ...}
+  - load_config:         读取 JSON 配置（自动归一化）
+  - load_mae_pretrained: 把 MAE 预训练共享权重加载进微调模型
+  - assert_competition_limits: 赛题红线校验（<1B 参数、共享率 >80%）
+  - ROOT / CODE_ROOT:    目录常量
 """
 
 import argparse
@@ -13,33 +14,34 @@ from pathlib import Path
 
 import torch
 
-# code/training/common.py -> parents[1]=code/, parents[2]=仓库根
 CODE_ROOT = Path(__file__).resolve().parents[1]
 ROOT = CODE_ROOT.parent
 
-# 归属 model 部分的键（其余键一律归 training，兼容旧扁平配置的未知训练参数）
+MAX_TOTAL_PARAMS = 1_000_000_000   # 赛题红线：总参数量 < 1B
+MIN_SHARED_RATIO = 0.80            # 赛题红线：权重共用率 > 80%
+
+# 旧扁平配置格式中归属 model 部分的键（新格式 {"model","training"} 直接透传）
 _MODEL_KEYS = {
-    "backbone", "d_model", "n_layers", "nhead", "ffn_hidden", "patch_size",
-    "sr_bins", "pos_encoding", "mask_ratio", "mae_decoder_layers", "head_hidden",
-    "use_frequency", "layer_types", "hybrid_layers",
-    "mla_kv_lora_rank", "mla_q_lora_rank",
+    "backbone", "d_model", "n_layers", "nhead", "ffn_hidden", "patch_size", "seq_len",
+    "mask_ratio", "mae_decoder_layers", "mae_decoder_dim", "layer_types", "hybrid_layers",
+    "mla_kv_lora_rank", "mla_q_lora_rank", "neck_layers", "neck_layer_types",
+    "head_config", "dropout", "drop_path",
 }
+
+# 预训练时从 MAE checkpoint 加载的模块前缀（neck / 任务头 / 任务提示不在预训练范围）
+PRETRAINED_PREFIXES = ("tokenizer.", "freq_stream.", "fusion.", "backbone.")
+_NOT_PRETRAINED = ("tokenizer.task_embed",)
 
 
 def normalize_config(cfg):
-    """配置格式归一化：输出恒为 {"model": {...}, "training": {...}}。
-
-    - 新格式（含 "model"/"training" 顶层键）: 直接透传，缺失部分补空 dict
-    - 旧版扁平格式: 按 _MODEL_KEYS 拆分为 model / training 两部分
-    """
+    """输出恒为 {"model": {...}, "training": {...}}（兼容旧扁平格式）。"""
     if "model" in cfg or "training" in cfg:
-        return {"model": cfg.get("model", {}), "training": cfg.get("training", {})}
+        return {"model": dict(cfg.get("model", {})), "training": dict(cfg.get("training", {}))}
     return {"model": {k: v for k, v in cfg.items() if k in _MODEL_KEYS},
             "training": {k: v for k, v in cfg.items() if k not in _MODEL_KEYS}}
 
 
 def base_arg_parser(description):
-    """预训练/微调共用的命令行参数（脚本可在此基础上追加专属参数）。"""
     parser = argparse.ArgumentParser(description=description)
     parser.add_argument("--config", default=str(CODE_ROOT / "configs" / "default.json"),
                         help="模型/训练 JSON 配置路径")
@@ -50,34 +52,61 @@ def base_arg_parser(description):
     parser.add_argument("--resume", default=None,
                         help="断点文件（mae_resume.pt / finetune_resume.pt），续训用")
     parser.add_argument("--smoke_steps", type=int, default=0,
-                        help=">0 时每 epoch 只跑指定步数（冒烟测试，跳过评估）")
+                        help=">0 时每 epoch 只跑指定步数且只跑 1 个 epoch（冒烟测试）")
     return parser
 
 
 def load_config(path):
-    """读取 JSON 配置并归一化为 {"model": ..., "training": ...}。"""
     with open(path, "r", encoding="utf-8") as f:
         return normalize_config(json.load(f))
 
 
-def load_mae_pretrained(model, path, logger=None):
-    """将 MAE 预训练的共享权重加载进模型（仅加载 checkpoint 中存在且模型有的模块）。
+def assert_competition_limits(model):
+    """赛题红线校验（按部署参数计，不含仅预训练的 MAE 解码器），返回 (shared_ratio, total)。"""
+    total = model.deploy_parameter_count()
+    shared_ratio = model.shared_ratio()
+    if total >= MAX_TOTAL_PARAMS:
+        raise ValueError(f"总参数量 {total} 超过 1B 红线")
+    if shared_ratio <= MIN_SHARED_RATIO:
+        raise ValueError(f"权重共用率 {shared_ratio:.2%} 未达 80% 红线")
+    return shared_ratio, total
 
-    任务头与 MAE decoder 不在预训练导出范围内，保持随机初始化。
+
+def load_mae_pretrained(model, path, logger=None):
+    """把 MAE 预训练的共享权重（tokenizer/频域流/融合/主干）加载进微调模型。
+
+    修复旧版缺陷：旧实现按 state["tokenizer"] 这种“模块名”键查找，而导出的是扁平
+    state_dict（tokenizer.xxx / backbone.xxx），结果一个张量也没加载——预训练白做。
+    现按前缀筛选扁平键、核对形状，并打印实际加载数量；一个都没加载上时直接报错。
 
     Returns:
-        bool: 是否成功加载。
+        int: 实际加载的张量数（路径不存在时返回 0，从头训练）。
     """
     if not Path(path).exists():
         if logger:
-            logger.info("no MAE checkpoint at %s, training from scratch", path)
-        return False
+            logger.warning("no MAE checkpoint at %s, finetuning from scratch", path)
+        return 0
     state = torch.load(path, map_location="cpu", weights_only=False)
-    loaded = []
-    for key in ("tokenizer", "backbone", "frequency_tokenizer", "cross_domain_fusion"):
-        if key in state and hasattr(model, key):
-            getattr(model, key).load_state_dict(state[key])
-            loaded.append(key)
+    flat = {}
+    for k, v in state.items():          # 兼容 {模块名: 子 state_dict} 的更早格式
+        if isinstance(v, dict):
+            flat.update({f"{k}.{kk}": vv for kk, vv in v.items()})
+        else:
+            flat[k] = v
+    own = model.state_dict()
+    cand = {k: v for k, v in flat.items()
+            if k.startswith(PRETRAINED_PREFIXES) and not k.startswith(_NOT_PRETRAINED)}
+    picked = {k: v for k, v in cand.items() if k in own and own[k].shape == v.shape}
+    skipped = sorted(set(cand) - set(picked))
+    if cand and not picked:
+        raise RuntimeError(f"MAE checkpoint {path} 与当前模型结构完全不匹配（0 个张量可加载），"
+                           "请确认预训练与微调使用同一份 model 配置")
+    model.load_state_dict(picked, strict=False)
+    expected = [k for k in own if k.startswith(PRETRAINED_PREFIXES)
+                and not k.startswith(_NOT_PRETRAINED)]
     if logger:
-        logger.info("loaded MAE pretrained weights from %s [%s]", path, ", ".join(loaded))
-    return True
+        logger.info("loaded MAE pretrained weights from %s: %d/%d tensors (%d skipped)",
+                    path, len(picked), len(expected), len(skipped))
+        if skipped:
+            logger.warning("  skipped (shape/key mismatch) e.g. %s", skipped[:5])
+    return len(picked)

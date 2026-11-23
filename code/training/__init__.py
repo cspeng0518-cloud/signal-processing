@@ -1,2 +1,1 @@
-from .pretrain_mae import main as pretrain_main
-from .finetune_multitask import main as finetune_main
+"""两阶段训练：pretrain_mae.py（MAE 自监督）-> finetune_multitask.py（三任务联合微调）。"""
