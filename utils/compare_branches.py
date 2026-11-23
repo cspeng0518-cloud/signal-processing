@@ -383,7 +383,7 @@ def stage_script(stage):
 
 
 def launch(branch, branch_dir, stage, cfg_path, out_dir, args, log_path, cards,
-           port, idx, steps, eval_test=False):
+           port, idx, steps, eval_test=False, resume_path=None):
     """构造一个训练 job（多卡时用 torchrun 拉起 --nproc 个进程）。"""
     script = stage_script(stage)
     argv = [script,
@@ -395,6 +395,8 @@ def launch(branch, branch_dir, stage, cfg_path, out_dir, args, log_path, cards,
             argv += ["--from_mae", str(mae)]
         if eval_test:
             argv.append("--eval_test")
+    if resume_path:
+        argv += ["--resume", str(resume_path)]
     if args.nproc > 1:
         cmd = [sys.executable, "-m", "torch.distributed.run",
                "--nnodes=1", "--node_rank=0",
@@ -602,6 +604,9 @@ def main():
                          "覆盖 run 目录里的 report.json")
     ap.add_argument("--run-dir", default=None,
                     help="--eval-only 复用的运行目录（默认最近一次 run_*）")
+    ap.add_argument("--resume", action="store_true",
+                    help="断点续训：复用上次 compare_<stage>.json 的 batch 配置，"
+                         "有 *_resume.pt 的分支从断点继续（不重新探针）")
     args = ap.parse_args()
 
     repo = Path(args.repo).resolve()
@@ -687,8 +692,30 @@ def main():
     run_dir.mkdir(parents=True, exist_ok=True)
     log(f"本次运行目录: {run_dir}")
 
+    # ---- 断点续训：复用上次写下的阶段配置与实测 batch ----
+    # 复用 batch 是为了让调度器总步数与断点里的 last_epoch 保持同一形状；
+    # 若显式改了 --epochs/--steps，说明是新实验，不按续训处理。
+    use_cfg_cache = bool(args.resume and not args.steps and not args.epochs)
+    if use_cfg_cache:
+        cached = {}
+        for name in BRANCHES:
+            vals = {}
+            for s in STAGES:
+                p = plan[name]["dir"] / "configs" / f"compare_{s}.json"
+                if p.exists():
+                    vals[s] = int(load_json(p)["training"]["batch_size"])
+            cached[name] = vals
+        if all(len(cached[b]) == len(STAGES) for b in BRANCHES):
+            for name in BRANCHES:
+                plan[name]["bs_verified"] = cached[name]
+            log("--resume: 复用上次阶段的 batch "
+                + " ".join(f"{b}={cached[b]}" for b in BRANCHES))
+        else:
+            log("--resume: 阶段配置不完整，重新探针")
+            use_cfg_cache = False
+
     # ---- 显存探针：每分支每阶段 1 步，OOM 对半降 ----
-    for i, name in enumerate(BRANCHES):
+    for i, name in enumerate(BRANCHES if not use_cfg_cache else ()):
         item = plan[name]
         out_dir = item["dir"] / "weights" / "compare_probe"
         for s in STAGES:
@@ -713,6 +740,13 @@ def main():
 
     common_bs = {s: min(plan[b]["bs_verified"][s] for b in BRANCHES) for s in STAGES}
     lr = {s: scaled_lr(common_bs[s], args.nproc, args.lr) for s in STAGES}
+    if use_cfg_cache:  # 续训以配置里真实的 lr 为准（可能来自不同 --nproc 的旧运行）
+        for s in STAGES:
+            vals = [float(load_json(plan[b]["dir"] / "configs" / f"compare_{s}.json")
+                          ["training"]["lr"]) for b in BRANCHES]
+            lr[s] = vals[0]
+            if len(set(vals)) > 1:
+                log(f"!! {s} 两分支配置 lr 不一致: {vals}")
     for s in STAGES:
         log(f"{s}: 公平 batch={common_bs[s]}（全局 {common_bs[s] * args.nproc}），"
             f"lr={lr[s]:.2e}")
@@ -725,14 +759,24 @@ def main():
             item = plan[name]
             out_dir = item["dir"] / "weights" / "compare"
             out_dir.mkdir(parents=True, exist_ok=True)
-            cfg = make_stage_cfg(item["chosen"], common_bs[stage], lr[stage],
-                                 args, stage, name)
+            cfg_path = item["dir"] / "configs" / f"compare_{stage}.json"
+            if use_cfg_cache and cfg_path.exists():
+                log(f"[{name}/{stage}] 复用上次配置 {cfg_path.name}")
+            else:
+                cfg = make_stage_cfg(item["chosen"], common_bs[stage], lr[stage],
+                                     args, stage, name)
+                cfg_path = write_cfg(item["dir"], cfg, stage)
+            resume_file = out_dir / ("mae_resume.pt" if stage == "pretrain"
+                                     else "finetune_resume.pt")
+            rp = resume_file if (args.resume and resume_file.exists()) else None
+            if rp:
+                log(f"[{name}/{stage}] 从断点续训: {rp}")
             jobs.append(launch(
-                name, item["dir"], stage, write_cfg(item["dir"], cfg, stage), out_dir,
+                name, item["dir"], stage, cfg_path, out_dir,
                 args, run_dir / f"{name}_{stage}.log",
                 card_range(args.card, args.nproc, i if args.parallel else 0),
                 args.port + (i if args.parallel else 0), i,
-                steps=args.steps, eval_test=(stage == "finetune")))
+                steps=args.steps, eval_test=(stage == "finetune"), resume_path=rp))
         done = run_jobs(jobs, parallel=args.parallel)
         results[stage] = {b: done[b][0] for b in BRANCHES}
         elapsed[stage] = {b: next(j["elapsed"] for j in jobs if j["branch"] == b)
