@@ -71,7 +71,11 @@ class Spec:
 
 
 def _dev():
-    return "cuda" if torch.cuda.is_available() else "cpu"
+    if torch.cuda.is_available():
+        return "cuda"
+    if hasattr(torch, "npu") and torch.npu.is_available():
+        return "npu"
+    return "cpu"
 
 
 def _tol(dtype=torch.float32):
@@ -86,20 +90,29 @@ def _tol(dtype=torch.float32):
 
 def _bench(fn, args, warmup=5, iters=20):
     dev = args[0].device.type if torch.is_tensor(args[0]) else "cpu"
+    # 预热
     for _ in range(warmup):
         with torch.no_grad():
             fn(*args)
+    # 设备同步 + 计时
     if dev == "cuda":
         torch.cuda.synchronize()
-        t0 = time.perf_counter()
-        for _ in range(iters):
-            fn(*args)
+    elif dev == "npu":
+        try:
+            torch.npu.synchronize()
+        except Exception:
+            pass
+    t0 = time.perf_counter()
+    for _ in range(iters):
+        fn(*args)
+    if dev == "cuda":
         torch.cuda.synchronize()
-    else:
-        t0 = time.perf_counter()
-        for _ in range(iters):
-            fn(*args)
-    return (time.perf_counter() - t0) / iters * 1e3
+    elif dev == "npu":
+        try:
+            torch.npu.synchronize()
+        except Exception:
+            pass
+    return (time.perf_counter() - t0) / iters * 1e3   # ms
 
 
 # ---------------------------------------------------------------- 数据申请
@@ -230,13 +243,16 @@ class TestRMSNorm:
         assert torch.allclose(x_r.grad.float(), x_t.grad.float(), **_tol(dtype))
         assert torch.allclose(w_r.grad.float(), w_t.grad.float(), **_tol(dtype))
 
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="延迟对比需要 CUDA")
+    @pytest.mark.skipif(torch.cuda.is_available() is False and
+                        (not (hasattr(torch, "npu") and torch.npu.is_available())),
+                        reason="延迟对比需要 CUDA 或 NPU")
     def test_latency(self):
         from code.models.ops.fused import rmsnorm, rmsnorm_reference
-        x, w = rmsnorm_inputs(Spec.D_MODEL, shape_prefix=(64, Spec.L), dev="cuda")
+        d = _dev()
+        x, w = rmsnorm_inputs(Spec.D_MODEL, shape_prefix=(64, Spec.L), dev=d)
         t_ref = _bench(rmsnorm_reference, (x, w))
         t_fus = _bench(rmsnorm, (x, w))
-        print(f"\n  rmsnorm  D={Spec.D_MODEL}, shape=[64,{Spec.L},{Spec.D_MODEL}]")
+        print(f"\n  [RMSNorm] D={Spec.D_MODEL}, shape=[64,{Spec.L},{Spec.D_MODEL}], dev={d}")
         print(f"    eager={t_ref:.3f}ms  fused={t_fus:.3f}ms  speedup={t_ref/max(t_fus,1e-9):.2f}x")
 
 
@@ -295,6 +311,18 @@ class TestSwiGLU:
         y_fus = swiglu(gate, up)
         assert torch.allclose(y_ref.float(), y_fus.float(), **_tol(dtype))
 
+    @pytest.mark.skipif(torch.cuda.is_available() is False and
+                        (not (hasattr(torch, "npu") and torch.npu.is_available())),
+                        reason="延迟对比需要 CUDA 或 NPU")
+    def test_latency(self):
+        from code.models.ops.fused import swiglu, swiglu_reference
+        d = _dev()
+        gate, up = swiglu_inputs(hidden=Spec.FFN_HIDDEN, shape_prefix=(64, Spec.L), dev=d)
+        t_ref = _bench(swiglu_reference, (gate, up))
+        t_fus = _bench(swiglu, (gate, up))
+        print(f"\n  [SwiGLU] hidden={Spec.FFN_HIDDEN}, shape=[64,{Spec.L},{Spec.FFN_HIDDEN}], dev={d}")
+        print(f"    eager={t_ref:.3f}ms  fused={t_fus:.3f}ms  speedup={t_ref/max(t_fus,1e-9):.2f}x")
+
 
 # ================================================================= Attention
 class TestAttention:
@@ -306,19 +334,37 @@ class TestAttention:
         y_fus = attention(q, k, v, mask)
         assert torch.allclose(y_ref.float(), y_fus.float(), atol=5e-3, rtol=5e-3)
 
+    @pytest.mark.skipif(torch.cuda.is_available() is False and
+                        (not (hasattr(torch, "npu") and torch.npu.is_available())),
+                        reason="延迟对比需要 CUDA 或 NPU")
+    def test_latency(self):
+        from code.models.ops.fused import attention, attention_reference
+        d = _dev()
+        q, k, v, mask = attention_inputs(B=64, L=Spec.L, dev=d)
+        t_ref = _bench(attention_reference, (q, k, v, mask))
+        t_fus = _bench(attention, (q, k, v, mask))
+        print(f"\n  [Attention] q={q.shape}, dev={d}")
+        print(f"    eager={t_ref:.3f}ms  fused={t_fus:.3f}ms  speedup={t_ref/max(t_fus,1e-9):.2f}x")
+
 
 # ================================================================= fused_status
 def test_fused_status_has_records():
     from code.models.ops.fused import fused_status, rmsnorm, swiglu, rope_rotate, rope_rotate_reference
-    x, w = rmsnorm_inputs(Spec.D_MODEL)
+    d = _dev()
+    x, w = rmsnorm_inputs(Spec.D_MODEL, dev=d)
     rmsnorm(x, w)
-    gate, up = swiglu_inputs()
+    gate, up = swiglu_inputs(dev=d)
     swiglu(gate, up)
-    x2, cos, sin, _ = rope_inputs()
+    x2, cos, sin, _ = rope_inputs(dev=d)
     rope_rotate(x2, cos, sin, None)
     status = fused_status()
-    assert any(k in status for k in ("rmsnorm", "swiglu", "rope")), status
-    print("\n  fused_status keys:", list(status.keys()))
+    print(f"\n  device={d}, fused_status:")
+    for k, v in status.items():
+        print(f"    {k}: {v}")
+    # NPU/CUDA 上 rmsnorm/swiglu/rope 至少有一条记录（融合或 fallback 都算）
+    if d != "cpu":
+        assert any(k in status for k in ("rmsnorm", "swiglu", "rope")), \
+            f"device={d} 应至少有一条融合记录，实际 status={status}"
 
 
 # ================================================================= smoke（直接执行时）
