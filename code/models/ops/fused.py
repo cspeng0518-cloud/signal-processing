@@ -8,12 +8,20 @@
       CUDA : Triton 融合 kernel（一次读写，省掉 silu 中间张量）
       NPU  : torch_npu.npu_swiglu
       其他 : torch 参考实现
+  rmsnorm / rope_rotate / mla_preprocess —— 同理自动分发
 
-所有融合实现首次调用时与参考实现做数值自检（allclose），不通过自动回退并记录原因
-——保证"国产平台换算子不掉精度"，也是技术报告里"算子迁移可验证"的工程证据。
-环境变量 EM_FUSED_OPS=0 可全局关闭融合路径（用于消融/排查）。
+控制开关
+--------
+环境变量（都能在运行前或运行中设置）:
+  EM_FUSED_OPS=0                    → 全局关闭所有融合
+  EM_FORCE_EAGER=attention,swiglu   → 强制某些算子走 eager（逗号分隔）
+                                      例: EM_FORCE_EAGER=rmsnorm,swiglu python train.py
+运行时 API（模型 forward 里也可以动态调）:
+  set_fused_enabled({"attention": True, "swiglu": False})
+  fused_status()                     → 看每个算子是否融合生效
+  fused_decision()                   → 当前配置下每个算子的决策表（返回 dict）
 
-注意：训练阶段同样走这些接口；Triton swiglu 带手写 backward（autograd.Function）。
+所有融合实现首次调用时与参考实现做数值自检（allclose），不通过自动回退并记录原因。
 """
 
 import math
@@ -24,6 +32,48 @@ import torch.nn.functional as F
 
 _ENABLED = os.environ.get("EM_FUSED_OPS", "1") != "0"
 _STATUS = {}          # op_name@device -> "fused" | "fallback: <reason>"
+
+# 算子级启用表：name -> True=允许融合, False=强制 eager
+# EM_FORCE_EAGER 环境变量可强制某些算子走 eager，例: EM_FORCE_EAGER=attention,swiglu
+_FORCE_EAGER = {name.strip(): True
+                for name in os.environ.get("EM_FORCE_EAGER", "").split(",")
+                if name.strip()}
+# 允许融合的算子白名单 —— 空 dict 表示 "全部允许"（除非 _ENABLED=False 或在 _FORCE_EAGER 里）
+_OP_ENABLED = {}
+
+
+def set_fused_enabled(mapping):
+    """运行时按算子名控制是否走融合路径。
+
+    Examples
+    --------
+    set_fused_enabled({"attention": True, "swiglu": False})   # swiglu 强制 eager
+    set_fused_enabled({"attention": True})                   # attention 融合，其他不变
+    """
+    global _OP_ENABLED
+    _OP_ENABLED.update(mapping)
+
+
+def _op_allowed(name):
+    """判断某个算子当前是否允许走融合路径（模块内部用）。"""
+    if not _ENABLED:
+        return False
+    if _FORCE_EAGER.get(name, False):
+        return False
+    if name in _OP_ENABLED and not _OP_ENABLED[name]:
+        return False
+    return True
+
+
+def fused_decision():
+    """返回每个算子当前的融合决策表（供外部/日志打印）。"""
+    names = ("attention", "swiglu", "rmsnorm", "rmsnorm_add", "rope_rotate", "mla_preprocess")
+    return {name: _op_allowed(name) for name in names}
+
+
+def fused_status():
+    """返回各融合算子的启用状态（infer/benchmark 日志打印用）。"""
+    return dict(_STATUS)
 
 try:                                          # 昇腾
     import torch_npu  # noqa: F401
@@ -102,14 +152,15 @@ def _selftest(name, fn, ref, *args):
 def attention(q, k, v, key_padding_mask=None, dropout_p=0.0, training=False):
     """多头注意力统一入口。缩放因子恒为 1/sqrt(E)（E = q 的最后一维）。"""
     dev = q.device.type
-    if _ENABLED and dev == "npu" and torch_npu is not None and q.size(-1) == v.size(-1):
-        if _selftest("npu_fusion_attention",
-                     lambda a, b, c, m: _npu_fa(a, b, c, m, 0.0, False),
-                     lambda a, b, c, m: attention_reference(a, b, c, m),
-                     q, k, v, key_padding_mask):
-            return _npu_fa(q, k, v, key_padding_mask, dropout_p, training)
-    if hasattr(F, "scaled_dot_product_attention") and dev != "npu":
-        return _sdpa(q, k, v, key_padding_mask, dropout_p, training)
+    if _op_allowed("attention"):
+        if dev == "npu" and torch_npu is not None and q.size(-1) == v.size(-1):
+            if _selftest("npu_fusion_attention",
+                         lambda a, b, c, m: _npu_fa(a, b, c, m, 0.0, False),
+                         lambda a, b, c, m: attention_reference(a, b, c, m),
+                         q, k, v, key_padding_mask):
+                return _npu_fa(q, k, v, key_padding_mask, dropout_p, training)
+        if hasattr(F, "scaled_dot_product_attention") and dev != "npu":
+            return _sdpa(q, k, v, key_padding_mask, dropout_p, training)
     return attention_reference(q, k, v, key_padding_mask, dropout_p, training)
 
 
@@ -171,12 +222,13 @@ def _npu_swiglu(gate, up):
 
 def swiglu(gate, up):
     dev = gate.device.type
-    if _ENABLED and dev == "cuda" and _HAS_TRITON:
-        if _selftest("triton_swiglu", _TritonSwiGLU.apply, swiglu_reference, gate, up):
-            return _TritonSwiGLU.apply(gate, up)
-    if _ENABLED and dev == "npu" and torch_npu is not None:
-        if _selftest("npu_swiglu", _npu_swiglu, swiglu_reference, gate, up):
-            return _npu_swiglu(gate, up)
+    if _op_allowed("swiglu"):
+        if dev == "cuda" and _HAS_TRITON:
+            if _selftest("triton_swiglu", _TritonSwiGLU.apply, swiglu_reference, gate, up):
+                return _TritonSwiGLU.apply(gate, up)
+        if dev == "npu" and torch_npu is not None:
+            if _selftest("npu_swiglu", _npu_swiglu, swiglu_reference, gate, up):
+                return _npu_swiglu(gate, up)
     return swiglu_reference(gate, up)
 
 
@@ -230,23 +282,24 @@ def rmsnorm(x, weight, eps=1e-6):
     """RMSNorm 统一入口。
 
     GPU : Triton autograd kernel
-    NPU : torch_npu.npu_rmsnorm（如可用）/ sgl_kernel_npu.layer_norm（如已装）
+    NPU : torch_npu.npu_rmsnorm / 多层 fallback
     其他 : 纯 torch 参考实现
     """
     dev = x.device.type
-    if _ENABLED and _HAS_TRITON and dev == "cuda":
-        if _selftest("triton_rmsnorm",
-                     lambda a, w: __import__("models.ops.triton_kernels", fromlist=["_TritonRMSNorm"])._TritonRMSNorm.apply(a, w, eps),
-                     lambda a, w: rmsnorm_reference(a, w, eps),
-                     x, weight):
+    if _op_allowed("rmsnorm"):
+        if _HAS_TRITON and dev == "cuda":
+            if _selftest("triton_rmsnorm",
+                         lambda a, w: __import__("models.ops.triton_kernels", fromlist=["_TritonRMSNorm"])._TritonRMSNorm.apply(a, w, eps),
+                         lambda a, w: rmsnorm_reference(a, w, eps),
+                         x, weight):
             from .triton_kernels import _TritonRMSNorm
             return _TritonRMSNorm.apply(x, weight, eps, None)
-    if _ENABLED and dev == "npu" and torch_npu is not None:
-        if _selftest("npu_rmsnorm",
-                     lambda a, w: _npu_rmsnorm(a, w, eps),
-                     lambda a, w: rmsnorm_reference(a, w, eps),
-                     x, weight):
-            return _npu_rmsnorm(x, weight, eps)
+        if dev == "npu" and torch_npu is not None:
+            if _selftest("npu_rmsnorm",
+                         lambda a, w: _npu_rmsnorm(a, w, eps),
+                         lambda a, w: rmsnorm_reference(a, w, eps),
+                         x, weight):
+                return _npu_rmsnorm(x, weight, eps)
     return rmsnorm_reference(x, weight, eps)
 
 
@@ -254,23 +307,23 @@ def rmsnorm_add(x, residual, weight, eps=1e-6):
     """Fused RMSNorm(x + residual) 统一入口。
 
     GPU : Triton autograd kernel（rmsnorm_add_fwd_kernel）
-    NPU : 如果 torch_npu 版本支持 fused layernorm+add 则用；否则回退 rmsnorm(x+res)
+    NPU : 回退 rmsnorm(x+res)
     其他 : 纯 torch 参考实现
     """
     dev = x.device.type
-    if _ENABLED and _HAS_TRITON and dev == "cuda":
-        if _selftest("triton_rmsnorm_add",
-                     lambda a, r, w: __import__("models.ops.triton_kernels", fromlist=["_TritonRMSNorm"])._TritonRMSNorm.apply(a, w, eps, r),
-                     lambda a, r, w: rmsnorm_add_reference(a, r, w, eps),
-                     x, residual, weight):
-            from .triton_kernels import _TritonRMSNorm
-            return _TritonRMSNorm.apply(x, weight, eps, residual)
-    if _ENABLED and dev == "npu" and torch_npu is not None:
-        # torch_npu 原生无 rmsnorm_add，但 npu_layernorm 支持 fused add（某些版本）
-        try:
-            return _npu_rmsnorm(x + residual, weight, eps)
-        except Exception:
-            pass
+    if _op_allowed("rmsnorm_add"):
+        if _HAS_TRITON and dev == "cuda":
+            if _selftest("triton_rmsnorm_add",
+                         lambda a, r, w: __import__("models.ops.triton_kernels", fromlist=["_TritonRMSNorm"])._TritonRMSNorm.apply(a, w, eps, r),
+                         lambda a, r, w: rmsnorm_add_reference(a, r, w, eps),
+                         x, residual, weight):
+                from .triton_kernels import _TritonRMSNorm
+                return _TritonRMSNorm.apply(x, weight, eps, residual)
+        if dev == "npu" and torch_npu is not None:
+            try:
+                return _npu_rmsnorm(x + residual, weight, eps)
+            except Exception:
+                pass
     return rmsnorm_add_reference(x, residual, weight, eps)
 
 
@@ -301,20 +354,17 @@ def rope_rotate(x, cos, sin, pos_ids=None):
     GPU : Triton autograd kernel（一次 launch，省 chunk/cat 中间 tensor）
     NPU : torch_npu.npu_rotary_embedding（如可用）/ 否则纯 torch
     其他 : 纯 torch 参考实现
-
-    接口与 attention.py 的 RoPEPositionalEncoding.rotate 完全一致，
-    可以直接替换：`rope_rotate(x, rope.cos, rope.sin, pos_ids)`。
     """
     dev = x.device.type
-    if _ENABLED and _HAS_TRITON and dev == "cuda":
-        if _selftest("triton_rope",
-                     lambda a, c, s, p: __import__("models.ops.triton_kernels", fromlist=["_TritonRoPE"])._TritonRoPE.apply(a, c, s, p),
-                     lambda a, c, s, p: rope_rotate_reference(a, c, s, p),
-                     x, cos, sin, pos_ids):
-            from .triton_kernels import _TritonRoPE
-            return _TritonRoPE.apply(x, cos, sin, pos_ids)
-    if _ENABLED and dev == "npu" and torch_npu is not None:
-        if hasattr(torch_npu, "npu_rotary_embedding"):
+    if _op_allowed("rope_rotate"):
+        if _HAS_TRITON and dev == "cuda":
+            if _selftest("triton_rope",
+                         lambda a, c, s, p: __import__("models.ops.triton_kernels", fromlist=["_TritonRoPE"])._TritonRoPE.apply(a, c, s, p),
+                         lambda a, c, s, p: rope_rotate_reference(a, c, s, p),
+                         x, cos, sin, pos_ids):
+                from .triton_kernels import _TritonRoPE
+                return _TritonRoPE.apply(x, cos, sin, pos_ids)
+        if dev == "npu" and torch_npu is not None and hasattr(torch_npu, "npu_rotary_embedding"):
             if _selftest("npu_rope",
                          lambda a, c, s, p: torch_npu.npu_rotary_embedding(
                              a.contiguous(), c.contiguous(), s.contiguous()),
