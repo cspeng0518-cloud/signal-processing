@@ -365,9 +365,11 @@ def test_fused_status_has_records():
     if d != "cpu":
         assert len(status) > 0, \
             f"device={d} 应至少有一条融合记录，实际 status={status}"
-        # 关键算子 rmsnorm/swiglu/rope/attention 至少一条
-        assert any(k.startswith(p) for p in ("rmsnorm", "swiglu", "rope", "attention")
-                   for k in status), \
+        # 关键算子 rmsnorm/swiglu/rope/attention 至少一条（key 带 npu_/triton_ 前缀，
+        # 用子串匹配）
+        expected = ("rmsnorm", "swiglu", "rope", "attention")
+        keys_str = " ".join(status.keys())
+        assert any(p in keys_str for p in expected), \
             f"缺少关键算子记录: {status}"
 
 
