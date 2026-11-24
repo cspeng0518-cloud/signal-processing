@@ -185,12 +185,13 @@ def _npu_swiglu(gate, up):
 def swiglu(gate, up):
     dev = gate.device.type
     if _op_enabled("swiglu"):
-        if dev == "cuda" and _HAS_TRITON:
-            if _selftest("triton_swiglu", _TritonSwiGLU.apply, swiglu_reference, gate, up):
-                return _TritonSwiGLU.apply(gate, up)
         if dev == "npu" and torch_npu is not None:
             if _selftest("npu_swiglu", _npu_swiglu, swiglu_reference, gate, up):
                 return _npu_swiglu(gate, up)
+        if dev == "cuda" and _HAS_TRITON:                  # Triton 作为备选
+            if _selftest("triton_swiglu", _TritonSwiGLU.apply, swiglu_reference, gate, up):
+                return _TritonSwiGLU.apply(gate, up)
+    # CUDA 默认走这里：F.silu + mul 两个 ATen kernel（CUTLASS 后端）
     return swiglu_reference(gate, up)
 
 
@@ -240,29 +241,45 @@ def _npu_rmsnorm(x, weight, eps):
     return rmsnorm_reference(x, weight, eps)
 
 
+def _aten_rmsnorm(x, weight, eps):
+    """PyTorch 2.4+ ATen RMSNorm — CUDA 上走 CUTLASS 融合 kernel。"""
+    if hasattr(F, "rms_norm"):
+        return F.rms_norm(x, (x.size(-1),), weight.float(), eps).to(x.dtype)
+    # 兜底：torch.nn.RMSNorm (PyTorch 2.4+)
+    if hasattr(torch.nn, "RMSNorm"):
+        try:
+            ln = torch.nn.RMSNorm(x.size(-1), eps=eps, device=x.device, dtype=torch.float32)
+            ln.weight = torch.nn.Parameter(weight.float().clone())
+            return ln(x.float()).to(x.dtype)
+        except Exception:
+            pass
+    return rmsnorm_reference(x, weight, eps)
+
+
 def rmsnorm(x, weight, eps=1e-6):
     """RMSNorm 统一入口。
 
-    GPU : Triton autograd kernel
+    GPU : 优先 PyTorch ATen (F.rms_norm) → Triton 备选 → eager 保底
     NPU : torch_npu.npu_rmsnorm / 多层 fallback
     其他 : 纯 torch 参考实现
     """
     dev = x.device.type
     if _op_enabled("rmsnorm"):
-        if _HAS_TRITON and dev == "cuda":
-            if _selftest("triton_rmsnorm",
-                         lambda a, w: __import__("models.ops.triton_kernels", fromlist=["_TritonRMSNorm"])._TritonRMSNorm.apply(a, w, eps),
-                         lambda a, w: rmsnorm_reference(a, w, eps),
-                         x, weight):
-            from .triton_kernels import _TritonRMSNorm
-            return _TritonRMSNorm.apply(x, weight, eps, None)
         if dev == "npu" and torch_npu is not None:
             if _selftest("npu_rmsnorm",
                          lambda a, w: _npu_rmsnorm(a, w, eps),
                          lambda a, w: rmsnorm_reference(a, w, eps),
                          x, weight):
                 return _npu_rmsnorm(x, weight, eps)
-    return rmsnorm_reference(x, weight, eps)
+        # CUDA 默认先试 ATen → Triton 作为备选 → 下面 eager 保底
+        if _HAS_TRITON and dev == "cuda":
+            if _selftest("triton_rmsnorm",
+                         lambda a, w: __import__("models.ops.triton_kernels", fromlist=["_TritonRMSNorm"])._TritonRMSNorm.apply(a, w, eps),
+                         lambda a, w: _aten_rmsnorm(a, w, eps),
+                         x, weight):
+                from .triton_kernels import _TritonRMSNorm
+                return _TritonRMSNorm.apply(x, weight, eps, None)
+    return _aten_rmsnorm(x, weight, eps)   # ATen 优先；没有 F.rms_norm 就 fallback 到 rmsnorm_reference
 
 
 def rmsnorm_add(x, residual, weight, eps=1e-6):
