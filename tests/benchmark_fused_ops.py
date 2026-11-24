@@ -27,16 +27,7 @@ import torch.nn.functional as F
 
 _ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_ROOT))
-
-# 关键：清掉可能被提前 import 的 stdlib 'code' 模块
-# Python 3 隐式 namespace 模式下, 任何包如果先 import 过 stdlib code, 你的 code/ 目录就被遮蔽
-if "code" in sys.modules:
-    print(f"[WARN] sys.modules['code'] = {sys.modules['code']!r}, 清除后再 import 本地 code 包")
-    del sys.modules["code"]
-if "code.models" in sys.modules:
-    del sys.modules["code.models"]
-if "code.models.ops" in sys.modules:
-    del sys.modules["code.models.ops"]
+sys.modules.pop("code", None)   # 清掉可能被提前 import 的 stdlib code 模块
 
 from code.models.ops import (  # noqa: E402
     attention, attention_reference,
