@@ -100,10 +100,10 @@
   },
   "operator": {
     "attention":   true,
-    "swiglu":      true,
-    "rmsnorm":     true,
-    "rmsnorm_add": true,
-    "rope_rotate": true,
-    "mla_preprocess": true
+    "swiglu":      false,
+    "rmsnorm":     false,
+    "rmsnorm_add": false,
+    "rope_rotate": false,
+    "mla_preprocess": false
   }
 }
