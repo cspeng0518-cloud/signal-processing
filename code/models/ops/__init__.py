@@ -1,19 +1,19 @@
 from .fused import (
-    attention,
-    swiglu,
-    rmsnorm,
-    rmsnorm_add,
-    rope_rotate,
+    attention, attention_reference,
+    swiglu, swiglu_reference,
+    rmsnorm, rmsnorm_reference,
+    rmsnorm_add, rmsnorm_add_reference,
+    rope_rotate, rope_rotate_reference,
     mla_preprocess,
     fused_status,
 )
 
 __all__ = [
-    "attention",
-    "swiglu",
-    "rmsnorm",
-    "rmsnorm_add",
-    "rope_rotate",
+    "attention", "attention_reference",
+    "swiglu", "swiglu_reference",
+    "rmsnorm", "rmsnorm_reference",
+    "rmsnorm_add", "rmsnorm_add_reference",
+    "rope_rotate", "rope_rotate_reference",
     "mla_preprocess",
     "fused_status",
 ]
