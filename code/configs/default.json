@@ -104,6 +104,7 @@
     "rmsnorm":     false,
     "rmsnorm_add": false,
     "rope_rotate": false,
-    "mla_preprocess": false
+    "mla_preprocess": false,
+    "compile":     false
   }
 }

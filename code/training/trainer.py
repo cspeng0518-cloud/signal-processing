@@ -105,6 +105,20 @@ class BaseTrainer(ABC):
             self.on_resume(extra)
             logger.info("resumed from %s at epoch %d", resume, self.start_epoch)
 
+        # ---- torch.compile（operator.compile=true 时开）----
+        if cfg.get("operator", {}).get("compile", False):
+            target = getattr(model, "backbone", model)  # backbone 存在就 compile 它, 否则 compile 整个 model
+            try:
+                # 先跑一个 dummy forward 触发 Dynamo trace, 避免第一次训练 step 变慢
+                _dummy = torch.zeros(1, cfg["training"]["seq_len"], cfg["model"]["d_model"],
+                                     device=device, dtype=next(target.parameters()).dtype)
+                target(_dummy)
+                model.backbone = torch.compile(target, dynamic=True) if hasattr(model, "backbone") \
+                    else torch.compile(model, dynamic=True)
+                logger.info("torch.compile 已开启 (dynamic=True)")
+            except Exception as e:
+                logger.warning("torch.compile 失败 (%s), 跳过, 训练继续", e)
+
     # ---------------- 调度 ----------------
     def steps_per_epoch(self):
         spe = self._spe
