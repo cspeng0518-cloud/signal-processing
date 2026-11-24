@@ -195,15 +195,26 @@ def rmsnorm_add_reference(x, residual, weight, eps=1e-6):
 
 
 def _npu_rmsnorm(x, weight, eps):
-    """调 torch_npu 原生 rmsnorm。若该版本 torch_npu 未暴露则 raise，调用方会 fallback。"""
-    if hasattr(torch_npu, "npu_rmsnorm"):
+    """NPU RMSNorm — 3 层 fallback，任何 torch_npu 版本都能跑。
+
+    1. torch_npu.npu_rmsnorm           → 昇腾专门写的融合算子（最快）
+    2. torch.ops.npu.npu_rmsnorm      → ATen 注册的 torch_npu 算子
+    3. torch.nn.RMSNorm (nn.Module)   → PyTorch 2.4+ 自带，走 ATen rms_norm kernel
+    4. raise → 调用方回退纯 torch eager（5 个 kernel）
+    """
+    if torch_npu is not None and hasattr(torch_npu, "npu_rmsnorm"):
         return torch_npu.npu_rmsnorm(x.contiguous(), weight.float(), eps).to(x.dtype)
     op = (torch.ops.npu.npu_rmsnorm
           if hasattr(torch.ops, "npu") and hasattr(torch.ops.npu, "npu_rmsnorm")
           else None)
     if op is not None:
         return op(x.contiguous(), weight.float(), eps).to(x.dtype)
-    raise RuntimeError("torch_npu 未暴露 rmsnorm 算子")
+    # PyTorch 2.4+ 自带 nn.RMSNorm，底层走 ATen 的 rms_norm kernel（NPU CANN 已实现）
+    if hasattr(torch.nn, "RMSNorm"):
+        ln = torch.nn.RMSNorm(x.size(-1), eps=eps, device=x.device, dtype=torch.float32)
+        ln.weight = torch.nn.Parameter(weight.float().clone())
+        return ln(x.float()).to(x.dtype)
+    raise RuntimeError("torch_npu / ATen 均未暴露 rmsnorm 算子")
 
 
 def rmsnorm(x, weight, eps=1e-6):
