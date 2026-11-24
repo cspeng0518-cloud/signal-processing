@@ -99,9 +99,12 @@ def _t(shape, dev, dtype=torch.float32):
 
 def _rope_inputs(dev):
     x = _t((REAL_BATCH, SEQ, NH, 2 * DH), dev)
-    inv_freq = 1.0 / (10000 ** (torch.arange(0, DH, 2, device=dev).float() / DH))
-    freqs = torch.outer(torch.arange(SEQ, device=dev).float(), inv_freq)
-    emb = torch.cat([freqs, freqs], dim=-1)
+    # 构造 cos/sin 最后一维 = 2*DH（完整 head_dim，对齐 fused.py rope_rotate_reference）
+    half = 2 * DH // 2   # = DH
+    inv_freq = 1.0 / (10000 ** (torch.arange(0, half, 2, device=dev).float() / half))
+    freqs = torch.outer(torch.arange(SEQ, device=dev).float(), inv_freq)  # [SEQ, half/2]
+    emb = torch.cat([freqs, freqs], dim=-1)                                # [SEQ, half] → 不够
+    emb = emb.repeat_interleave(2, dim=-1)[:SEQ, :2 * DH]                 # 扩展到 [SEQ, 2*DH]
     return x, emb.cos(), emb.sin()
 
 
@@ -229,7 +232,11 @@ def run(batch_tiers, apply=False, report_path=None):
         if fused is None or eager is None:
             keep = current_op.get(name, True)
             rec = f"— (测试失败, 保持 {keep})"
-        elif sp >= 1.2 and err_ok:
+            print(f"  {name:12s}  (测试失败)  → {rec}")
+            suggestions[name] = keep
+            continue
+        err_ok = err is not None and err < 1e-2
+        if sp >= 1.2 and err_ok:
             keep = True
             rec = "✅ 保留融合"
         elif sp < 1.0 and err_ok:
