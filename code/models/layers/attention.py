@@ -23,7 +23,7 @@
 import torch
 import torch.nn as nn
 
-from ..ops.fused import attention, swiglu
+from ..ops.fused import attention, swiglu, rmsnorm, rope_rotate, mla_preprocess
 
 
 class RMSNorm(nn.Module):
@@ -35,10 +35,7 @@ class RMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x):
-        dtype = x.dtype
-        x = x.float()
-        x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-        return self.weight * x.to(dtype)
+        return rmsnorm(x, self.weight, self.eps)
 
 
 class DropPath(nn.Module):
@@ -113,8 +110,8 @@ class MultiHeadAttention(nn.Module):
         B, L, D = x.shape
         q, k, v = self.qkv(x).view(B, L, 3, self.nhead, self.head_dim).unbind(2)  # [B,L,H,Dh]
         if self.use_rope and rope is not None:
-            q = rope.rotate(q, pos_ids)
-            k = rope.rotate(k, pos_ids)
+            q = rope_rotate(q, rope.cos, rope.sin, pos_ids)
+            k = rope_rotate(k, rope.cos, rope.sin, pos_ids)
         q, k, v = (t.transpose(1, 2) for t in (q, k, v))                         # [B,H,L,Dh]
         o = attention(q, k, v, key_padding_mask, self.dropout, self.training)
         return self.out_drop(self.proj(o.transpose(1, 2).reshape(B, L, D)))
@@ -151,15 +148,17 @@ class MLAAttention(nn.Module):
     def forward(self, x, rope=None, pos_ids=None, key_padding_mask=None):
         B, L, _ = x.shape
         H, dh = self.nhead, self.dh
-        q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(x))).view(B, L, H, 2 * dh)
+        # Q/KV 预处理走融合入口（内部 RMSNorm 自动走 Triton / torch_npu）
+        q, kv, k_pe = mla_preprocess(
+            x, self.q_a_proj, self.q_a_layernorm, self.q_b_proj,
+            self.kv_a_proj, self.kv_a_layernorm, self.kv_b_proj,
+            H, dh, self.kv_lora_rank)
         q_nope, q_pe = q.split([dh, dh], dim=-1)
-        kv_nope, k_pe = self.kv_a_proj(x).split([self.kv_lora_rank, dh], dim=-1)
-        kv = self.kv_b_proj(self.kv_a_layernorm(kv_nope)).view(B, L, H, 2 * dh)
         k_nope, v = kv.split([dh, dh], dim=-1)
         k_pe = k_pe.unsqueeze(2)                                       # [B,L,1,dh]
         if rope is not None:                                           # 只旋转 rope 通道
-            q_pe = rope.rotate(q_pe, pos_ids)
-            k_pe = rope.rotate(k_pe, pos_ids)
+            q_pe = rope_rotate(q_pe, rope.cos, rope.sin, pos_ids)
+            k_pe = rope_rotate(k_pe, rope.cos, rope.sin, pos_ids)
         k_pe = k_pe.expand(B, L, H, dh)
         q = torch.cat([q_nope, q_pe], dim=-1).transpose(1, 2)          # [B,H,L,2dh]
         k = torch.cat([k_nope, k_pe], dim=-1).transpose(1, 2)          # [B,H,L,2dh]

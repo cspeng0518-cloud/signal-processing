@@ -178,3 +178,162 @@ def swiglu(gate, up):
         if _selftest("npu_swiglu", _npu_swiglu, swiglu_reference, gate, up):
             return _npu_swiglu(gate, up)
     return swiglu_reference(gate, up)
+
+
+# ====================================================================== RMSNorm
+def rmsnorm_reference(x, weight, eps=1e-6):
+    """Pure torch RMSNorm 参考实现。"""
+    dtype = x.dtype
+    x = x.float()
+    y = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)
+    return (weight * y).to(dtype)
+
+
+def rmsnorm_add_reference(x, residual, weight, eps=1e-6):
+    """Fused RMSNorm(x + residual) 参考实现（先加再归一化，省一个中间 tensor 的写回）。"""
+    return rmsnorm_reference(x + residual, weight, eps)
+
+
+def _npu_rmsnorm(x, weight, eps):
+    """调 torch_npu 原生 rmsnorm。若该版本 torch_npu 未暴露则 raise，调用方会 fallback。"""
+    if hasattr(torch_npu, "npu_rmsnorm"):
+        return torch_npu.npu_rmsnorm(x.contiguous(), weight.float(), eps).to(x.dtype)
+    op = (torch.ops.npu.npu_rmsnorm
+          if hasattr(torch.ops, "npu") and hasattr(torch.ops.npu, "npu_rmsnorm")
+          else None)
+    if op is not None:
+        return op(x.contiguous(), weight.float(), eps).to(x.dtype)
+    raise RuntimeError("torch_npu 未暴露 rmsnorm 算子")
+
+
+def rmsnorm(x, weight, eps=1e-6):
+    """RMSNorm 统一入口。
+
+    GPU : Triton autograd kernel
+    NPU : torch_npu.npu_rmsnorm（如可用）/ sgl_kernel_npu.layer_norm（如已装）
+    其他 : 纯 torch 参考实现
+    """
+    dev = x.device.type
+    if _ENABLED and _HAS_TRITON and dev == "cuda":
+        if _selftest("triton_rmsnorm",
+                     lambda a, w: __import__("models.ops.triton_kernels", fromlist=["_TritonRMSNorm"])._TritonRMSNorm.apply(a, w, eps),
+                     lambda a, w: rmsnorm_reference(a, w, eps),
+                     x, weight):
+            from .triton_kernels import _TritonRMSNorm
+            return _TritonRMSNorm.apply(x, weight, eps, None)
+    if _ENABLED and dev == "npu" and torch_npu is not None:
+        if _selftest("npu_rmsnorm",
+                     lambda a, w: _npu_rmsnorm(a, w, eps),
+                     lambda a, w: rmsnorm_reference(a, w, eps),
+                     x, weight):
+            return _npu_rmsnorm(x, weight, eps)
+    return rmsnorm_reference(x, weight, eps)
+
+
+def rmsnorm_add(x, residual, weight, eps=1e-6):
+    """Fused RMSNorm(x + residual) 统一入口。
+
+    GPU : Triton autograd kernel（rmsnorm_add_fwd_kernel）
+    NPU : 如果 torch_npu 版本支持 fused layernorm+add 则用；否则回退 rmsnorm(x+res)
+    其他 : 纯 torch 参考实现
+    """
+    dev = x.device.type
+    if _ENABLED and _HAS_TRITON and dev == "cuda":
+        if _selftest("triton_rmsnorm_add",
+                     lambda a, r, w: __import__("models.ops.triton_kernels", fromlist=["_TritonRMSNorm"])._TritonRMSNorm.apply(a, w, eps, r),
+                     lambda a, r, w: rmsnorm_add_reference(a, r, w, eps),
+                     x, residual, weight):
+            from .triton_kernels import _TritonRMSNorm
+            return _TritonRMSNorm.apply(x, weight, eps, residual)
+    if _ENABLED and dev == "npu" and torch_npu is not None:
+        # torch_npu 原生无 rmsnorm_add，但 npu_layernorm 支持 fused add（某些版本）
+        try:
+            return _npu_rmsnorm(x + residual, weight, eps)
+        except Exception:
+            pass
+    return rmsnorm_add_reference(x, residual, weight, eps)
+
+
+# ====================================================================== RoPE
+def rope_rotate_reference(x, cos, sin, pos_ids=None):
+    """Pure torch RoPE 参考实现（与 attention.py RoPEPositionalEncoding.rotate 对齐）。
+
+    x: [B, L, H, Dh] （attention.py 的用法）
+    cos/sin: [max_len, Dh]（最后一维是完整 head_dim，不是 half_d）
+    pos_ids: [B, L] 或 None（None 时用 0..L-1）
+
+    旋转公式：x1, x2 = x.chunk(2, -1); return x*cos + cat([-x2,x1])*sin
+    """
+    if pos_ids is None:
+        cos = cos[: x.size(1)][None, :, None, :]      # [1, L, 1, Dh]
+        sin = sin[: x.size(1)][None, :, None, :]
+    else:
+        cos = cos[pos_ids].unsqueeze(2)                # [B, L, 1, Dh]
+        sin = sin[pos_ids].unsqueeze(2)
+    cos, sin = cos.to(x.dtype), sin.to(x.dtype)
+    x1, x2 = x.chunk(2, dim=-1)
+    return x * cos + torch.cat([-x2, x1], dim=-1) * sin
+
+
+def rope_rotate(x, cos, sin, pos_ids=None):
+    """RoPE 统一入口。
+
+    GPU : Triton autograd kernel（一次 launch，省 chunk/cat 中间 tensor）
+    NPU : torch_npu.npu_rotary_embedding（如可用）/ 否则纯 torch
+    其他 : 纯 torch 参考实现
+
+    接口与 attention.py 的 RoPEPositionalEncoding.rotate 完全一致，
+    可以直接替换：`rope_rotate(x, rope.cos, rope.sin, pos_ids)`。
+    """
+    dev = x.device.type
+    if _ENABLED and _HAS_TRITON and dev == "cuda":
+        if _selftest("triton_rope",
+                     lambda a, c, s, p: __import__("models.ops.triton_kernels", fromlist=["_TritonRoPE"])._TritonRoPE.apply(a, c, s, p),
+                     lambda a, c, s, p: rope_rotate_reference(a, c, s, p),
+                     x, cos, sin, pos_ids):
+            from .triton_kernels import _TritonRoPE
+            return _TritonRoPE.apply(x, cos, sin, pos_ids)
+    if _ENABLED and dev == "npu" and torch_npu is not None:
+        if hasattr(torch_npu, "npu_rotary_embedding"):
+            try:
+                return torch_npu.npu_rotary_embedding(x.contiguous(), cos.contiguous(), sin.contiguous())
+            except Exception:
+                pass
+    return rope_rotate_reference(x, cos, sin, pos_ids)
+
+
+# ============================================================= MLA preprocess
+def mla_preprocess(x, q_a_proj, q_a_ln, q_b_proj,
+                   kv_a_proj, kv_a_ln, kv_b_proj, H, dh, kv_lora_rank):
+    """MLA q/kv 预处理统一入口。
+
+    计算 q = q_b_proj(q_a_ln(q_a_proj(x)))、kv = kv_b_proj(kv_a_ln(kv_a_proj(x)))。
+    融合点在 q_a_ln / kv_a_ln（用 rmsnorm 入口），
+    Linear 本身由 torch / NPU 后端各自优化。
+
+    GPU : Linear + Triton RMSNorm（rmsnorm 入口）
+    NPU : Linear + torch_npu RMSNorm（rmsnorm 入口）
+    其他 : Linear + eager rmsnorm（rmsnorm_reference）
+
+    Args:
+        x: [B, L, D]
+        q_a_proj / q_b_proj / kv_a_proj / kv_b_proj: nn.Linear（weight.t() 转置格式）
+        q_a_ln / kv_a_ln: 带 .weight 和 .eps 的 RMSNorm / nn.LayerNorm / 任意 weight tensor
+        H, dh, kv_lora_rank: 结构参数
+
+    Returns:
+        q:  [B, L, H, 2*dh]
+        kv: [B, L, H, 2*dh]
+        k_pe_raw: [B, L, dh] （解耦 RoPE 的 k_rope 通道，不参与 KV 压缩）
+    """
+    q_a_w = q_a_ln.weight if hasattr(q_a_ln, "weight") else q_a_ln
+    q_a_eps = getattr(q_a_ln, "eps", 1e-6)
+    kv_a_w = kv_a_ln.weight if hasattr(kv_a_ln, "weight") else kv_a_ln
+    kv_a_eps = getattr(kv_a_ln, "eps", 1e-6)
+
+    q = q_b_proj(rmsnorm(q_a_proj(x), q_a_w, q_a_eps))
+    kv_full = kv_a_proj(x)
+    kv_nope, k_pe = kv_full.split([kv_lora_rank, dh], dim=-1)
+    kv = kv_b_proj(rmsnorm(kv_nope, kv_a_w, kv_a_eps))
+    return (q.view(x.size(0), x.size(1), H, 2 * dh),
+            kv.view(x.size(0), x.size(1), H, 2 * dh), k_pe)
