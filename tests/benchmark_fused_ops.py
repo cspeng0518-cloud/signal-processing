@@ -36,6 +36,7 @@ from code.models.ops import (  # noqa: E402
     rope_rotate, rope_rotate_reference,
     fused_status,
 )
+import code.models.ops.fused as _fused_mod   # noqa: E402 — 为了临时改 _ENABLED_OP
 
 # --------------------------------------------------------------------------- 配置
 
@@ -172,11 +173,17 @@ def run(batch_tiers, apply=False, report_path=None):
     cfg = _load_default()
     current_op = cfg.get("operator", {})
 
+    # ---- benchmark 期间临时全开融合（测真实融合速度），退出后恢复 ----
+    _saved = dict(_fused_mod._ENABLED_OP)
+    _fused_mod._ENABLED_OP = {k: True for k in ("attention", "swiglu", "rmsnorm", "rmsnorm_add", "rope_rotate", "mla_preprocess")}
+    _fused_mod._STATUS.clear()
+
     print(f"\n{'='*60}")
     print(f"  设备: {dev}")
     print(f"  batch 档位: {batch_tiers}  训练 batch: {REAL_BATCH}")
     print(f"  seq={SEQ}  d_model={D}  nhead={NH}  ffn_hidden={FFN_H}")
     print(f"  current operator: {current_op}")
+    print(f"  (benchmark 期间临时全开融合, --apply 后写回 default.json)")
     print(f"{'='*60}\n")
 
     ops = [
@@ -271,6 +278,9 @@ def run(batch_tiers, apply=False, report_path=None):
     # ---- 写 markdown ----
     if report_path:
         _write_report(report_path, results, suggestions, dev, REAL_BATCH, current_op)
+
+    # ---- 恢复 fused 模块的 operator 开关 ----
+    _fused_mod._ENABLED_OP = _saved
 
     return results, suggestions
 
