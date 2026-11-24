@@ -195,26 +195,35 @@ def rmsnorm_add_reference(x, residual, weight, eps=1e-6):
 
 
 def _npu_rmsnorm(x, weight, eps):
-    """NPU RMSNorm — 3 层 fallback，任何 torch_npu 版本都能跑。
+    """NPU RMSNorm — 多层 fallback，任何 torch_npu 版本都能跑且不 raise。
 
-    1. torch_npu.npu_rmsnorm           → 昇腾专门写的融合算子（最快）
-    2. torch.ops.npu.npu_rmsnorm      → ATen 注册的 torch_npu 算子
-    3. torch.nn.RMSNorm (nn.Module)   → PyTorch 2.4+ 自带，走 ATen rms_norm kernel
-    4. raise → 调用方回退纯 torch eager（5 个 kernel）
+    1. torch_npu.npu_rmsnorm
+    2. torch.ops.npu.npu_rmsnorm
+    3. torch.nn.RMSNorm (PyTorch 2.4+ ATen)
+    4. 内部调 rmsnorm_reference（eager 5-kernel，任何 NPU 都有）
     """
     if torch_npu is not None and hasattr(torch_npu, "npu_rmsnorm"):
-        return torch_npu.npu_rmsnorm(x.contiguous(), weight.float(), eps).to(x.dtype)
+        try:
+            return torch_npu.npu_rmsnorm(x.contiguous(), weight.float(), eps).to(x.dtype)
+        except Exception:
+            pass
     op = (torch.ops.npu.npu_rmsnorm
           if hasattr(torch.ops, "npu") and hasattr(torch.ops.npu, "npu_rmsnorm")
           else None)
     if op is not None:
-        return op(x.contiguous(), weight.float(), eps).to(x.dtype)
-    # PyTorch 2.4+ 自带 nn.RMSNorm，底层走 ATen 的 rms_norm kernel（NPU CANN 已实现）
+        try:
+            return op(x.contiguous(), weight.float(), eps).to(x.dtype)
+        except Exception:
+            pass
     if hasattr(torch.nn, "RMSNorm"):
-        ln = torch.nn.RMSNorm(x.size(-1), eps=eps, device=x.device, dtype=torch.float32)
-        ln.weight = torch.nn.Parameter(weight.float().clone())
-        return ln(x.float()).to(x.dtype)
-    raise RuntimeError("torch_npu / ATen 均未暴露 rmsnorm 算子")
+        try:
+            ln = torch.nn.RMSNorm(x.size(-1), eps=eps, device=x.device, dtype=torch.float32)
+            ln.weight = torch.nn.Parameter(weight.float().clone())
+            return ln(x.float()).to(x.dtype)
+        except Exception:
+            pass
+    # 最后的兜底：直接调参考实现（rmsnorm_reference 是纯 torch，任何设备必能跑）
+    return rmsnorm_reference(x, weight, eps)
 
 
 def rmsnorm(x, weight, eps=1e-6):
