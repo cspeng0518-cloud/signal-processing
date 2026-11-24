@@ -295,10 +295,12 @@ def rope_rotate(x, cos, sin, pos_ids=None):
             return _TritonRoPE.apply(x, cos, sin, pos_ids)
     if _ENABLED and dev == "npu" and torch_npu is not None:
         if hasattr(torch_npu, "npu_rotary_embedding"):
-            try:
+            if _selftest("npu_rope",
+                         lambda a, c, s, p: torch_npu.npu_rotary_embedding(
+                             a.contiguous(), c.contiguous(), s.contiguous()),
+                         lambda a, c, s, p: rope_rotate_reference(a, c, s, p),
+                         x, cos, sin, pos_ids):
                 return torch_npu.npu_rotary_embedding(x.contiguous(), cos.contiguous(), sin.contiguous())
-            except Exception:
-                pass
     return rope_rotate_reference(x, cos, sin, pos_ids)
 
 

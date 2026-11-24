@@ -361,10 +361,14 @@ def test_fused_status_has_records():
     print(f"\n  device={d}, fused_status:")
     for k, v in status.items():
         print(f"    {k}: {v}")
-    # NPU/CUDA 上 rmsnorm/swiglu/rope 至少有一条记录（融合或 fallback 都算）
+    # NPU/CUDA 上应有融合记录（不管是 fused 还是 fallback）
     if d != "cpu":
-        assert any(k in status for k in ("rmsnorm", "swiglu", "rope")), \
+        assert len(status) > 0, \
             f"device={d} 应至少有一条融合记录，实际 status={status}"
+        # 关键算子 rmsnorm/swiglu/rope/attention 至少一条
+        assert any(k.startswith(p) for p in ("rmsnorm", "swiglu", "rope", "attention")
+                   for k in status), \
+            f"缺少关键算子记录: {status}"
 
 
 # ================================================================= smoke（直接执行时）
