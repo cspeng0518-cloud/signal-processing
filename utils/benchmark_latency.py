@@ -5,8 +5,7 @@
   python utils/benchmark_latency.py --config code/configs/default.json   # 只测结构（随机权重）
 
 对每种 (精度 × 是否 compile × batch × 长度) 组合报告 P50/P95 单 batch 时延、
-每样本时延与吞吐，结果写 logs/benchmark/latency.json，可直接贴进技术报告与
-docs/self_test_report.md。
+每样本时延与吞吐，结果写 logs/benchmark/latency.json，可直接贴进技术报告。
 """
 
 import argparse

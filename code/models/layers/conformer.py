@@ -7,7 +7,7 @@
     x = x + 1/2 * FFN(LN(x))
     x = LN(x)
 
-为什么只放在 neck、不放进预训练主干（实测结论，见 docs/REFACTOR_NOTES.md）:
+为什么只放在 neck、不放进预训练主干（实测结论）:
   * 相同 ~100M 参数下全 Conformer 主干显存约为 FA/MLA 混合主干的 3 倍
     （每层两个 FFN + 卷积模块 + 多个 LayerNorm 的 fp32 激活），batch 与参数量都打不上去；
   * 卷积需要连续时间序列，无法使用 MAE “只编码可见 token” 的 gather 加速路径，
