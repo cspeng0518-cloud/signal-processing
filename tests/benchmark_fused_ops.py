@@ -59,7 +59,7 @@ SEQ_RAW = int(MODEL.get("seq_len", 1024))
 SEQ = max(1, SEQ_RAW // int(MODEL.get("patch_size", 8)))
 REAL_BATCH = int(TRAINING.get("batch_size", 512))
 
-BATCH_TIERS = (4, 32, 128, REAL_BATCH)
+BATCH_TIERS = (256, 512, 768, 1024)
 
 # --------------------------------------------------------------------------- 设备
 
