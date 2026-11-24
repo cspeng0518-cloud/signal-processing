@@ -6,8 +6,6 @@ from .fused import (
     rope_rotate,
     mla_preprocess,
     fused_status,
-    fused_decision,
-    set_fused_enabled,
 )
 
 __all__ = [
@@ -18,6 +16,4 @@ __all__ = [
     "rope_rotate",
     "mla_preprocess",
     "fused_status",
-    "fused_decision",
-    "set_fused_enabled",
 ]

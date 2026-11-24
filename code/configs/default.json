@@ -97,5 +97,13 @@
     "codec": {"max_classes": 32, "decode": "expectation"},
     "score_weights": {"protocol": 0.3, "modulation": 0.3, "parameter": 0.4},
     "ref_scale": 0.5
+  },
+  "operator": {
+    "attention":   true,
+    "swiglu":      true,
+    "rmsnorm":     true,
+    "rmsnorm_add": true,
+    "rope_rotate": true,
+    "mla_preprocess": true
   }
 }
