@@ -12,13 +12,29 @@ val 用于早停与导出，test 只在训练结束 `--eval_test` 时用一次�
 
 ## 2. 两阶段训练
 
+训练放 tmux 里跑（裸终端断开后 tqdm 写 pty 会阻塞僵死）；日志已由代码写入 `logs/train.log`，无需重定向：
+
 ```bash
 # 阶段一：MAE 自监督预训练（三任务数据混用；FA/MLA 主干；val 重建损失早停）
-python code/training/pretrain_mae.py --data_dir datasets --out_dir weights
+tmux new-session -d -s pretrain 'python code/training/pretrain_mae.py --data_dir datasets --out_dir weights'
 # 阶段二：多任务微调（加载 mae_pretrained.pt；叠加 Conformer neck；val 代理分数早停）
-python code/training/finetune_multitask.py --data_dir datasets --out_dir weights --eval_test
+tmux new-session -d -s finetune 'python code/training/finetune_multitask.py --data_dir datasets --out_dir weights --eval_test'
+# 断点续训：--resume weights/finetune_resume.pt（僵死进程先 kill）
 ```
-多卡：`torchrun --nproc_per_node=N <脚本> ...`；batch_size 为单卡值。
+
+- 查看：`tmux attach -t <会话名>`；退出按 `Ctrl-b` `d`，训练继续。
+- 多卡（GPU 走 nccl，昇腾 NPU 自动切 hccl，无需额外参数）：
+
+```bash
+# 4 卡微调（tmux 中）
+tmux new-session -d -s finetune 'torchrun --nproc_per_node=4 \
+    code/training/finetune_multitask.py --data_dir datasets --out_dir weights --eval_test'
+# 只用指定卡：CUDA_VISIBLE_DEVICES=0,1 配合 --nproc_per_node=2
+# 多个训练并行时错开 rendezvous 端口：--rdzv_endpoint=localhost:29501
+```
+
+  `batch_size` 为单卡值（总 batch = 单卡值 × 卡数）；日志、checkpoint、TensorBoard 只由
+  主进程（rank 0）写，其他卡不落盘。断点续训同样加 `--resume`。
 
 产物（`weights/`）：
 | 文件 | 阶段 | 用途 |
@@ -30,6 +46,20 @@ python code/training/finetune_multitask.py --data_dir datasets --out_dir weights
 
 日志：`logs/train.log`、`logs/{pretrain,finetune}_metrics.jsonl`、`logs/{...}_steps.jsonl`、
 `logs/plots/*.png`、`logs/tb/`（TensorBoard）。
+
+### TensorBoard
+
+```bash
+tensorboard --logdir logs/tb --port 6006 --bind_all   # 注意是 --bind_all（下划线），不是 --bind-all
+```
+
+- 写入内容：每 50 步（`log_every`）写 step 级 `train/loss_*`、`train/grad_norm`、`train/lr`；
+  每 epoch 写 `epoch/<指标>` 前缀的验证指标。TensorBoard 软依赖，未安装不影响训练。
+- 日志目录按阶段分开：`logs/tb/pretrain/`、`logs/tb/finetune/`，同一目录下多个事件文件会被
+  TensorBoard 按 global_step 自动合并。
+- 断点续训无缝衔接：checkpoint 保存了 `global_step`，resume 后新事件文件从该值继续计数，
+  曲线连续。注意 resume 回退重跑的 epoch 会有同一 step 区间重复的两个数据点，曲线上表现为轻微毛刺。
+
 
 **必须核对的日志行**
 - 微调：`loaded MAE pretrained weights ... N/M tensors`（N≈M；路径存在但 0 个可加载会直接报错）
