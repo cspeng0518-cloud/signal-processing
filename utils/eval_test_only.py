@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
-"""对已训练权重做 test 复算（不训练、不改权重）。
+"""对已训练权重做 test 复算（不训练、不改权重、不写任何日志/权重文件）。
 
-由 utils/compare_branches.py --eval-only 调用，输出与 finetune --eval_test
-相同格式的 [test] 行，供 compare 脚本解析：
+默认读 weights/ 下的 config.json + model.safetensors + param_codec.json：
 
-  python utils/eval_test_only.py --style main --branch-dir <dir> \
-      --weights <dir> --data <dir> [--batch-size 256] [--ref-scale 0.5]
+  python utils/eval_test_only.py            # 等价于 --style conformer --branch-dir . \
+                                            #   --weights weights --data datasets
 
-两分支的模型/数据 API 不同，这里按 style 分支处理，指标实现复用各分支
-training/tasks.py（已统一为 SI + 预测 pattern 掩码 + nRMSE）。
+由 utils/compare_branches.py --eval-only 调用时同样传全套显式参数。
+输出与 finetune --eval_test 相同格式的 [test] 行，供 compare 脚本解析。
 """
 import argparse
 import json
@@ -18,6 +17,8 @@ from pathlib import Path
 
 def pick_device():
     import torch
+    if torch.cuda.is_available():
+        return torch.device("cuda")
     try:
         import torch_npu  # noqa: F401
         if torch.npu.is_available():
@@ -28,11 +29,12 @@ def pick_device():
 
 
 def main():
+    root = Path(__file__).resolve().parents[1]
     ap = argparse.ArgumentParser()
-    ap.add_argument("--style", required=True, choices=("main", "conformer"))
-    ap.add_argument("--branch-dir", required=True)
-    ap.add_argument("--weights", required=True, help="含 config.json/model.safetensors 的目录")
-    ap.add_argument("--data", required=True)
+    ap.add_argument("--style", default="conformer", choices=("main", "conformer"))
+    ap.add_argument("--branch-dir", default=str(root))
+    ap.add_argument("--weights", default=str(root / "weights"), help="含 config.json/model.safetensors 的目录")
+    ap.add_argument("--data", default=str(root / "datasets"))
     ap.add_argument("--batch-size", type=int, default=0, help="0=取 config 里的 batch_size")
     ap.add_argument("--ref-scale", type=float, default=0.5)
     a = ap.parse_args()
