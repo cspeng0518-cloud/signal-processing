@@ -1,4 +1,4 @@
-"""电磁信号可视化工具（独立于 code/，不依赖训练框架）
+"""电磁信号可视化工具（独立于 src/，不依赖训练框架）
 
 从 datasets/ 下的 Parquet 文件加载 IQ 信号，为每条样本生成 2x2 组合图:
   左上: 时域波形（I/Q 双通道）
@@ -23,8 +23,8 @@ matplotlib.use("Agg")  # 无 GUI 后端，直接落盘
 import matplotlib.pyplot as plt
 from scipy import signal as sp_signal
 
-# 复用 code/utils 的数据读取（iq bytes 反序列化）
-CODE_UTILS = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "code", "utils"))
+# 复用 src/utils 的数据读取（iq bytes 反序列化）
+CODE_UTILS = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src", "utils"))
 sys.path.insert(0, os.path.dirname(CODE_UTILS))
 from utils.dataset import bytes_to_iq  # noqa: E402
 

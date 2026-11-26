@@ -1,7 +1,7 @@
 """分类任务 bad case 分析（重点：任务 2 调制识别准确率低的根因定位）
 
 用法（单卡）:
-  python code/utils/bad_case_analysis.py --task modulation --weights_dir weights \
+  python src/utils/bad_case_analysis.py --task modulation --weights_dir weights \
       --data_dir datasets --split val --n_max 20000 --n_fig 6
 
 输出到 logs/bad_case/<task>/:

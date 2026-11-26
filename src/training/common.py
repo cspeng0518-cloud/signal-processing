@@ -43,7 +43,7 @@ def normalize_config(cfg):
 
 def base_arg_parser(description):
     parser = argparse.ArgumentParser(description=description)
-    parser.add_argument("--config", default=str(CODE_ROOT / "configs" / "default.json"),
+    parser.add_argument("--config", default=str(ROOT / "src" / "configs" / "default.json"),
                         help="模型/训练 JSON 配置路径")
     parser.add_argument("--data_dir", default=str(ROOT / "datasets"),
                         help="数据目录（官方预处理 memmap 或模拟 parquet 布局）")

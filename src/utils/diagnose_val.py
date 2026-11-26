@@ -1,7 +1,7 @@
 """val 链路诊断：定位微调 val 指标异常的环节（单卡，NPU/GPU/CPU 均可）。
 
 用法:
-  python code/utils/diagnose_val.py --data_dir datasets --weights_dir weights [--n_sub 4096]
+  python src/utils/diagnose_val.py --data_dir datasets --weights_dir weights [--n_sub 4096]
 
 诊断决策树（按输出顺序对照）:
   1) train/val 标签直方图             -> 切分/meta 是否损坏（应接近均匀）

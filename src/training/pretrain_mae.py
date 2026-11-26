@@ -1,9 +1,9 @@
 """阶段一：MAE 自监督预训练（三任务训练数据混用，任务无关）。
 
 用法:
-  python code/training/pretrain_mae.py --data_dir datasets --out_dir weights          # 单卡
-  torchrun --nproc_per_node=N code/training/pretrain_mae.py --data_dir datasets        # 多卡
-  python code/training/pretrain_mae.py --smoke_steps 2                                # 冒烟
+  python src/training/pretrain_mae.py --data_dir datasets --out_dir weights          # 单卡
+  torchrun --nproc_per_node=N src/training/pretrain_mae.py --data_dir datasets        # 多卡
+  python src/training/pretrain_mae.py --smoke_steps 2                                # 冒烟
 
 产出: weights/mae_pretrained.pt（val 重建损失最佳时刷新）、weights/mae_resume.pt（断点）
 主干: FA + MLA 混合（只编码约 25% 可见 token，省显存）；Conformer neck 不参与预训练。

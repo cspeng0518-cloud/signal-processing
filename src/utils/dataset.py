@@ -12,7 +12,7 @@
 两种数据布局（make_task_dataset 自动选择）:
   官方预处理 memmap: {data_dir}/{task}/iq.memap + meta.json（utils/prepare_official.py 产出，
                      train/val/test 划分记录在 meta）
-  Parquet:           {data_dir}/{split}_{task}.parquet（code/utils/data_gen.py 模拟数据）
+  Parquet:           {data_dir}/{split}_{task}.parquet（src/utils/data_gen.py 模拟数据）
 
 返回样本字段:
   iq [N,2] float32（右侧补零到 seq_len；单位功率归一化在模型前端做）

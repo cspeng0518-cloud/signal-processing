@@ -2,7 +2,7 @@
 
 用法:
   python utils/benchmark_latency.py --weights_dir weights                # 测已训练权重
-  python utils/benchmark_latency.py --config code/configs/default.json   # 只测结构（随机权重）
+  python utils/benchmark_latency.py --config src/configs/default.json   # 只测结构（随机权重）
 
 对每种 (精度 × 是否 compile × batch × 长度) 组合报告 P50/P95 单 batch 时延、
 每样本时延与吞吐，结果写 logs/benchmark/latency.json，可直接贴进技术报告。
@@ -16,7 +16,7 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "code"))
+sys.path.insert(0, str(ROOT / "src"))
 
 import torch  # noqa: E402
 
@@ -74,7 +74,7 @@ def bench(model, device, B, L, task, precision, iters, warmup):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--config", default=str(ROOT / "code" / "configs" / "default.json"))
+    ap.add_argument("--config", default=str(ROOT / "src" / "configs" / "default.json"))
     ap.add_argument("--compare", default=None, help="再测一个配置做对比")
     ap.add_argument("--weights_dir", default=None)
     ap.add_argument("--batches", type=int, nargs="+", default=[1, 64, 256])

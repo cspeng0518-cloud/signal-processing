@@ -6,10 +6,10 @@
 本脚本无需任何数据集，几分钟内给出真实数字。
 
 用法:
-  python utils/measure_vram.py --config code/configs/default.json            # 测当前配置
-  python utils/measure_vram.py --config code/configs/default.json --find_max_bs
-  python utils/measure_vram.py --grid code/configs/grid.json --limit 4        # 批量测 grid
-  python utils/measure_vram.py --grid code/configs/grid.json --budget 76
+  python utils/measure_vram.py --config src/configs/default.json            # 测当前配置
+  python utils/measure_vram.py --config src/configs/default.json --find_max_bs
+  python utils/measure_vram.py --grid src/configs/grid.json --limit 4        # 批量测 grid
+  python utils/measure_vram.py --grid src/configs/grid.json --budget 76
 
 输出: 每个配置 pretrain / finetune 两阶段的 max_allocated / max_reserved（GB），
       是否超过 --budget（默认 76GB，80G 卡留 4GB 余量），写入 logs/vram/report.json。
@@ -22,7 +22,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "code"))
+sys.path.insert(0, str(ROOT / "src"))
 
 import torch  # noqa: E402
 
@@ -163,7 +163,7 @@ def main():
         if args.limit:
             items = items[: args.limit]
     else:
-        path = args.config or str(ROOT / "code" / "configs" / "default.json")
+        path = args.config or str(ROOT / "src" / "configs" / "default.json")
         items = [(Path(path).stem, json.load(open(path, encoding="utf-8")))]
     report = []
     for name, cfg in items:

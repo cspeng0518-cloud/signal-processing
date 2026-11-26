@@ -37,7 +37,7 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-GRID_DEFAULT = ROOT / "code" / "configs" / "grid.json"
+GRID_DEFAULT = ROOT / "src" / "configs" / "grid.json"
 
 
 # ---------------------------------------------------------------- 工具
@@ -76,7 +76,7 @@ def run_stage(stage_script, cfg_path, data_dir, out_dir, log_path,
 
     nproc > 1 时用 torchrun（GPU 走 nccl, 昇腾 NPU 走 hccl）拉起多卡 DDP。
     """
-    script = str(ROOT / "code" / "training" / stage_script)
+    script = str(ROOT / "src" / "training" / stage_script)
     if nproc > 1:
         cmd = [sys.executable, "-m", "torch.distributed.run",
                f"--nproc_per_node={nproc}", "--standalone",

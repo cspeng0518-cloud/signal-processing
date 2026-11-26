@@ -12,7 +12,7 @@ import pandas as pd
 import pytest
 import torch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "code"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from models import build_model                                   # noqa: E402
 from training.common import load_mae_pretrained                  # noqa: E402
 from training.tasks import TASKS                                 # noqa: E402

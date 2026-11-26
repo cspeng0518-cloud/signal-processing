@@ -43,7 +43,7 @@ class TestLoadSamples:
         path = os.path.join(DATASET_DIR, "train_modulation.parquet")
         if not os.path.exists(path):
             import pytest
-            pytest.skip("datasets 未生成，先运行 code/utils/data_gen.py")
+            pytest.skip("datasets 未生成，先运行 src/utils/data_gen.py")
         samples = load_samples(path, n=2)
         assert len(samples) == 2
         s = samples[0]

@@ -10,5 +10,9 @@ logs/
 datasets/
 
 # Local manual tuning configs & runtime text log (per-machine, not shared)
-code/configs/a800_*.json
+config/a800_*.json
 logs/train.log
+
+# 离线依赖 wheel（提交打包时需带上，但不入 git）
+wheels/
+out/

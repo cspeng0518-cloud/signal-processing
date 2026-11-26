@@ -1,6 +1,6 @@
 ---
 name: search-config-agent
-description: Use when measuring GPU/NPU memory for EMFoundation configs, choosing batch sizes, comparing default.json variants, or regenerating code/configs/grid.json (at most 20 configs).
+description: Use when measuring GPU/NPU memory for EMFoundation configs, choosing batch sizes, comparing default.json variants, or regenerating src/configs/grid.json (at most 20 configs).
 ---
 
 # Search Config Agent
@@ -33,7 +33,7 @@ python utils/gen_configs.py \
     --min_params 300 \
     --max_configs 20 \
     --auto_grad_checkpoint 1024 \
-    --out code/configs/grid.json \
+    --out src/configs/grid.json \
     [--dry]               # 只枚举不写文件
 ```
 
@@ -46,7 +46,7 @@ python utils/gen_configs.py \
 ### 实测显存
 
 ```bash
-python utils/measure_vram.py --grid code/configs/grid.json --budget 76
+python utils/measure_vram.py --grid src/configs/grid.json --budget 76
 python utils/measure_vram.py --config <cfg> --find_max_bs   # 单配置找最大 batch
 ```
 
@@ -89,7 +89,7 @@ python utils/gen_configs.py \
 ### 2. Measure
 
 ```bash
-python utils/measure_vram.py --grid code/configs/grid.json --budget 76
+python utils/measure_vram.py --grid src/configs/grid.json --budget 76
 ```
 
 读 `logs/vram/report.json`，按 `fits_budget=true` 筛出通过的配置。
@@ -103,13 +103,13 @@ python utils/measure_vram.py --grid code/configs/grid.json --budget 76
 
 ### 3. Commit grid.json
 
-只把通过的配置写回 `code/configs/grid.json`：
+只把通过的配置写回 `src/configs/grid.json`：
 
 ```python
 # agent 用 Python 执行
 import json
 report = json.load(open("logs/vram/report.json"))
-grid = json.load(open("code/configs/grid.json"))
+grid = json.load(open("src/configs/grid.json"))
 verified = []
 for cfg in grid["configs"]:
     entry = next((e for e in report if e.get("name") == cfg["name"]), None)
@@ -117,10 +117,10 @@ for cfg in grid["configs"]:
         cfg["training"]["batch_size_pretrain"] = entry.get("pretrain_bs", cfg["training"]["batch_size_pretrain"])
         cfg["training"]["batch_size"] = entry.get("batch_size", cfg["training"]["batch_size"])
         verified.append(cfg)
-json.dump({"configs": verified}, open("code/configs/grid.json", "w"), indent=2, ensure_ascii=False)
+json.dump({"configs": verified}, open("src/configs/grid.json", "w"), indent=2, ensure_ascii=False)
 ```
 
-**不要**直接覆盖 `code/configs/default.json`，要改 default 时先 copy 一份改名。
+**不要**直接覆盖 `src/configs/default.json`，要改 default 时先 copy 一份改名。
 
 **如果 verified 为空**（全部 OOM / 超 budget）：
 - 降 batch 下限到 192 试一轮
@@ -147,7 +147,7 @@ GPU: A800 80GB  torch: X.Y+cuXYZ  命令: gen_configs.py + measure_vram.py --bud
 ## Rules
 
 - Conformer layers 放 `neck_layer_types`，**绝不**放 `layer_types`（会 raise）
-- 实验期间**永不覆盖** `code/configs/default.json`，需要新 default 就 copy 一份改名
+- 实验期间**永不覆盖** `src/configs/default.json`，需要新 default 就 copy 一份改名
 - gen_configs 的参数量是 meta 设备上精确计数，**不是**公式估算——和旧 probe_vram 流程的根本区别
 - measure_vram 的 `fits_budget` 字段是最终判定，不要自己算 reserved 和 budget
 - 重试最多 3 轮，超过请停下来检查模型结构（batch 是否下限太低）

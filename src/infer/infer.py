@@ -1,7 +1,7 @@
 """统一推理入口（官方评测程序直接调用）
 
 官方要求:
-  - 位于 $HOME/code/infer.py
+  - 位于 $HOME/src/infer/infer.py
   - 输入: test Parquet（task / sample_id / iq 3 列，混合三任务，512/1024 两种长度）
   - 输出: JSONL，每行 {task, sample_id, prediction}，顺序与输入行序一致
     分类: prediction 为官方类别名字符串
@@ -15,8 +15,8 @@
   4. 预热 + 计时：日志输出解析/模型耗时、每样本耗时、吞吐，以及融合算子启用状态
 
 用法:
-  python code/infer.py --input test.parquet --output out/pred.jsonl
-  python code/infer.py --input test.parquet --output out/pred.jsonl --precision fp32 --batch_size 256
+  python src/infer/infer.py --input test.parquet --output out/pred.jsonl
+  python src/infer/infer.py --input test.parquet --output out/pred.jsonl --precision fp32 --batch_size 256
 """
 
 import argparse
@@ -29,8 +29,9 @@ import numpy as np
 import pandas as pd
 import torch
 
-ROOT = os.path.abspath(os.path.dirname(__file__))  # code/
-sys.path.insert(0, ROOT)
+SRC = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # src/
+PKG = os.path.dirname(SRC)                                         # 仓库根目录
+sys.path.insert(0, SRC)
 
 from models import build_model                                  # noqa: E402
 from training.common import load_config                         # noqa: E402
@@ -80,6 +81,7 @@ def infer_file(model, parquet_path, out_path, seq_len, device, batch_size=256,
                precision="bf16", logger=None, warmup=True):
     """官方输入（混合三任务，行序任意）-> JSONL（严格保持输入行序）。"""
     df = pd.read_parquet(parquet_path, columns=["task", "sample_id", "iq"])
+    task_out = df["task"].astype(str).tolist()          # 原样回显到输出
     df["task"] = df["task"].replace({"system": "protocol"})
     unknown = set(df["task"]) - {"protocol", "modulation", "parameter"}
     if unknown:
@@ -118,7 +120,7 @@ def infer_file(model, parquet_path, out_path, seq_len, device, batch_size=256,
                     p = {n: float(pred[j, k]) for k, n in enumerate(PARAM_NAMES)}
                 else:
                     p = ID2LABEL[task][int(pred[j])]
-                results[i] = {"task": task, "sample_id": str(sids[i]), "prediction": p}
+                results[i] = {"task": task_out[i], "sample_id": sids[i], "prediction": p}
     _sync(device)
     t_model = time.perf_counter() - t1
 
@@ -134,19 +136,32 @@ def infer_file(model, parquet_path, out_path, seq_len, device, batch_size=256,
     return results
 
 
+def load_env_config():
+    """读取 config/infer.json（运行环境配置：设备/精度/批大小/权重目录）。"""
+    path = os.path.join(PKG, "config", "infer.json")
+    if os.path.isfile(path):
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+
 def main():
+    env = load_env_config()
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", required=True, help="测试 Parquet 文件路径")
     parser.add_argument("--output", required=True, help="输出 JSONL 路径")
-    parser.add_argument("--weights_dir", default=os.path.join(ROOT, "..", "weights"))
-    parser.add_argument("--batch_size", type=int, default=256)
-    parser.add_argument("--precision", default="bf16", choices=["bf16", "fp16", "fp32"])
+    parser.add_argument("--weights_dir",
+                        default=os.path.join(PKG, env.get("weights_dir", "weights")))
+    parser.add_argument("--batch_size", type=int, default=int(env.get("batch_size", 256)))
+    parser.add_argument("--precision", default=env.get("precision", "bf16"),
+                        choices=["bf16", "fp16", "fp32"])
     parser.add_argument("--compile", action="store_true", help="torch.compile 主干（CUDA）")
     args = parser.parse_args()
 
     from utils.train_utils import get_device
-    device = get_device()
-    logger = get_logger("inference", os.path.join(ROOT, "..", "logs"), "inference.log")
+    dev_pref = str(env.get("device", "auto")).lower()
+    device = get_device() if dev_pref == "auto" else torch.device(dev_pref)
+    logger = get_logger("inference", os.path.join(PKG, "logs"), "inference.log")
     model, cfg = load_model(args.weights_dir, device)
     if args.compile and device.type == "cuda":
         model.backbone = torch.compile(model.backbone, dynamic=True)

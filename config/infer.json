@@ -1,0 +1,8 @@
+{
+  "_note": "推理运行环境配置（run.sh / src/infer/infer.py 读取；可用环境变量 BATCH_SIZE / PRECISION 覆盖）",
+  "device": "auto",
+  "precision": "bf16",
+  "batch_size": 256,
+  "weights_dir": "weights",
+  "compile": false
+}

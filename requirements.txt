@@ -1,0 +1,13 @@
+# Python 依赖声明（推理环境）
+# 评测基础镜像已提供 CUDA 12.8 + torch 2.9.0+cu128，此处不重复安装 torch
+numpy>=1.24
+pandas>=2.0
+pyarrow>=14.0
+safetensors>=0.4
+
+# ---- 训练/分析额外依赖（本地训练时才需要；评测镜像不需要） ----
+# torch==2.3.1
+# tqdm==4.66.4
+# tensorboard==2.16.2
+# matplotlib==3.8.4
+# pytest==8.0.0

@@ -40,7 +40,7 @@ import code.models.ops.fused as _fused_mod   # noqa: E402 — 为了临时改 _E
 
 # --------------------------------------------------------------------------- 配置
 
-_CONFIG_PATH = _ROOT / "code" / "configs" / "default.json"
+_CONFIG_PATH = _ROOT / "src" / "configs" / "default.json"
 
 
 def _load_default():

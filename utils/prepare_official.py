@@ -35,10 +35,10 @@ import pyarrow.parquet as pq
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, ROOT)
-# 复用 code/utils/dataset.py 的双格式 iq 读取（同名包冲突，按路径加载）
+# 复用 src/utils/dataset.py 的双格式 iq 读取（同名包冲突，按路径加载）
 import importlib.util as _ilu
 _spec = _ilu.spec_from_file_location(
-    "_official_ds", os.path.join(ROOT, "code", "utils", "dataset.py"))
+    "_official_ds", os.path.join(ROOT, "src", "utils", "dataset.py"))
 _official_ds = _ilu.module_from_spec(_spec)
 _spec.loader.exec_module(_official_ds)
 to_iq_array = _official_ds.to_iq_array

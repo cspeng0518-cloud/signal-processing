@@ -40,7 +40,7 @@ def main():
     a = ap.parse_args()
 
     branch = Path(a.branch_dir).resolve()
-    sys.path.insert(0, str(branch / "code"))
+    sys.path.insert(0, str(branch / "src"))
     import torch
     from safetensors.torch import load_file
 

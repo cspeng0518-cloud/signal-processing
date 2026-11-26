@@ -3,7 +3,7 @@
 
 显存不再用公式估算（旧公式只在单点校准、系统性低估）——生成后请用实测工具筛选:
     python utils/gen_configs.py --d_model 512 768 1024 --n_layers 24 30 --neck 2 4
-    python utils/measure_vram.py --grid code/configs/grid.json --budget 76
+    python utils/measure_vram.py --grid src/configs/grid.json --budget 76
     python utils/run_grid.py --dry
 
 约束（违者剔除）:
@@ -26,7 +26,7 @@ import os
 import sys
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-sys.path.insert(0, os.path.join(ROOT, "code"))
+sys.path.insert(0, os.path.join(ROOT, "src"))
 
 MAX_TOTAL_PARAMS = 1_000_000_000
 MIN_SHARED_RATIO = 0.80
@@ -46,8 +46,8 @@ def count_params(model_cfg):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--template", default=os.path.join(ROOT, "code", "configs", "default.json"))
-    ap.add_argument("--out", default=os.path.join(ROOT, "code", "configs", "grid.json"))
+    ap.add_argument("--template", default=os.path.join(ROOT, "src", "configs", "default.json"))
+    ap.add_argument("--out", default=os.path.join(ROOT, "src", "configs", "grid.json"))
     ap.add_argument("--d_model", type=int, nargs="+", default=[512, 768, 1024])
     ap.add_argument("--n_layers", type=int, nargs="+", default=[24, 30])
     ap.add_argument("--ffn_mult", type=float, nargs="+", default=[4.0])

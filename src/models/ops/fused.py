@@ -1,6 +1,6 @@
 ﻿"""融合算子分发层：同一接口，按设备自动选择最快且数值正确的实现。
 
-融合开关来自 code/configs/default.json 的 operator 字段：
+融合开关来自 src/configs/default.json 的 operator 字段：
   "operator": { "attention": true, "swiglu": false, "rmsnorm": false, ... }
 写 false 即强制该算子走 eager；环境变量 EM_FUSED_OPS=0 可全局关闭。
 
@@ -17,7 +17,7 @@ import torch.nn.functional as F
 
 # ---- 启动时读一次 operator 配置 ----
 try:
-    _cfg_path = Path(__file__).resolve().parents[2] / "configs" / "default.json"
+    _cfg_path = Path(__file__).resolve().parents[2] / "src" / "configs" / "default.json"
     _ENABLED_OP = dict(json.loads(_cfg_path.read_text()).get("operator", {}))
 except Exception:
     _ENABLED_OP = {}

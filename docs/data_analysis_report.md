@@ -39,7 +39,7 @@
 | `symbol_rate` ~ `number_of_pulses` | float | 任务3 的 7 个参数真值（仅 parameter 行适用） |
 | `symbol_rate_valid` ~ `number_of_pulses_valid` | bool | 每参数独立的有效位（false = 该参数不适用此样本） |
 
-注意：**官方真实数据的 iq 是原生 `list<list<float>>` 嵌套列**（非 bytes），我们现有 `code/utils/dataset.py` 的 bytes 反序列化路径需适配这一点（我们模拟数据是 bytes 存储，读取层做双格式兼容即可）。
+注意：**官方真实数据的 iq 是原生 `list<list<float>>` 嵌套列**（非 bytes），我们现有 `src/utils/dataset.py` 的 bytes 反序列化路径需适配这一点（我们模拟数据是 bytes 存储，读取层做双格式兼容即可）。
 
 ## 三、任务与数据对应关系
 

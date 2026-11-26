@@ -1,7 +1,7 @@
 """算子级 profiling（定位推理热点，决定是否值得写融合算子）
 
 用法:
-  python utils/profile_model.py --config code/configs/default.json --batch 256 --length 1024
+  python utils/profile_model.py --config src/configs/default.json --batch 256 --length 1024
   python utils/profile_model.py --weights_dir weights --precision bf16
 
 输出:
@@ -21,7 +21,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "code"))
+sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "utils"))
 
 import torch  # noqa: E402
@@ -32,7 +32,7 @@ from utils.train_utils import get_device  # noqa: E402
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--config", default=str(ROOT / "code" / "configs" / "default.json"))
+    ap.add_argument("--config", default=str(ROOT / "src" / "configs" / "default.json"))
     ap.add_argument("--weights_dir", default=None)
     ap.add_argument("--batch", type=int, default=256)
     ap.add_argument("--length", type=int, default=1024)

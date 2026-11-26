@@ -23,10 +23,10 @@
 ## 2. 实测流程
 
 ```bash
-python utils/measure_vram.py --config code/configs/default.json            # 两阶段峰值
-python utils/measure_vram.py --config code/configs/default.json --find_max_bs
+python utils/measure_vram.py --config src/configs/default.json            # 两阶段峰值
+python utils/measure_vram.py --config src/configs/default.json --find_max_bs
 python utils/gen_configs.py --d_model 512 768 1024 --n_layers 24 30 --neck 2 4
-python utils/measure_vram.py --grid code/configs/grid.json --budget 76
+python utils/measure_vram.py --grid src/configs/grid.json --budget 76
 ```
 
 ## 3. 实测记录（请在训练机上填写）

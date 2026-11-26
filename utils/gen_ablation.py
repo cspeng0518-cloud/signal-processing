@@ -2,7 +2,7 @@
 
 用法：
     python utils/gen_ablation.py                         # 生成全部消融配置
-    python utils/gen_ablation.py --out code/configs/ablation
+    python utils/gen_ablation.py --out src/configs/ablation
     python utils/gen_ablation.py --filter B               # 只生成 B 组
     python utils/gen_ablation.py --dry                    # 只打印不落盘
 
@@ -16,7 +16,7 @@ import os
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DEFAULT = os.path.join(ROOT, "code", "configs", "default.json")
+DEFAULT = os.path.join(ROOT, "src", "configs", "default.json")
 
 ABLATIONS = [
     # === A: 任务 1 时-频双流 / 融合消融 ===
@@ -62,8 +62,8 @@ def deep_merge(base, patch):
 
 def main():
     ap = argparse.ArgumentParser(description="生成消融实验 JSON 配置")
-    ap.add_argument("--out", default=os.path.join(ROOT, "code", "configs", "ablation"),
-                    help="输出目录（默认 code/configs/ablation/）")
+    ap.add_argument("--out", default=os.path.join(ROOT, "src", "configs", "ablation"),
+                    help="输出目录（默认 src/configs/ablation/）")
     ap.add_argument("--filter", default="",
                     help="按编号前缀过滤，如 A/B/C/D 或 A0/C3")
     ap.add_argument("--dry", action="store_true", help="只打印不落盘")

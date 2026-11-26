@@ -16,9 +16,9 @@ val 用于早停与导出，test 只在训练结束 `--eval_test` 时用一次�
 
 ```bash
 # 阶段一：MAE 自监督预训练（三任务数据混用；FA/MLA 主干；val 重建损失早停）
-tmux new-session -d -s pretrain 'python code/training/pretrain_mae.py --data_dir datasets --out_dir weights'
+tmux new-session -d -s pretrain 'python src/training/pretrain_mae.py --data_dir datasets --out_dir weights'
 # 阶段二：多任务微调（加载 mae_pretrained.pt；叠加 Conformer neck；val 代理分数早停）
-tmux new-session -d -s finetune 'python code/training/finetune_multitask.py --data_dir datasets --out_dir weights --eval_test'
+tmux new-session -d -s finetune 'python src/training/finetune_multitask.py --data_dir datasets --out_dir weights --eval_test'
 # 断点续训：--resume weights/finetune_resume.pt（僵死进程先 kill）
 ```
 
@@ -28,7 +28,7 @@ tmux new-session -d -s finetune 'python code/training/finetune_multitask.py --da
 ```bash
 # 4 卡微调（tmux 中）
 tmux new-session -d -s finetune 'torchrun --nproc_per_node=4 \
-    code/training/finetune_multitask.py --data_dir datasets --out_dir weights --eval_test'
+    src/training/finetune_multitask.py --data_dir datasets --out_dir weights --eval_test'
 # 只用指定卡：CUDA_VISIBLE_DEVICES=0,1 配合 --nproc_per_node=2
 # 多个训练并行时错开 rendezvous 端口：--rdzv_endpoint=localhost:29501
 ```
@@ -85,9 +85,9 @@ tensorboard --logdir logs/tb --port 6006 --bind_all   # 注意是 --bind_all（�
 ## 4. 诊断与分析
 
 ```bash
-python code/utils/diagnose_val.py --weights_dir weights          # val 链路逐级诊断
-python code/utils/bad_case_analysis.py --task modulation          # 混淆矩阵 / SNR 分桶 / 错例图
-python utils/gen_ablation.py && ls code/configs/ablation          # 消融配置（技术报告）
+python src/utils/diagnose_val.py --weights_dir weights          # val 链路逐级诊断
+python src/utils/bad_case_analysis.py --task modulation          # 混淆矩阵 / SNR 分桶 / 错例图
+python utils/gen_ablation.py && ls src/configs/ablation          # 消融配置（技术报告）
 python utils/benchmark_latency.py --weights_dir weights           # 推理时延（复赛 30 分）
 python utils/profile_model.py --weights_dir weights               # 算子热点
 python utils/export_onnx.py --weights_dir weights                 # ONNX -> ATC / TensorRT
@@ -97,7 +97,7 @@ python utils/export_onnx.py --weights_dir weights                 # ONNX -> ATC 
 
 ```bash
 python utils/gen_configs.py --d_model 512 768 1024 --n_layers 24 30
-python utils/measure_vram.py --grid code/configs/grid.json --budget 76
+python utils/measure_vram.py --grid src/configs/grid.json --budget 76
 python utils/run_grid.py --dry && python utils/run_grid.py
 ```
 

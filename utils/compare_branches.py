@@ -368,7 +368,7 @@ def make_stage_cfg(chosen, bs, lr, args, stage, branch_name):
 
 
 def write_cfg(branch_dir, cfg, stage):
-    p = branch_dir / "configs" / f"compare_{stage}.json"
+    p = branch_dir / "src" / "configs" / f"compare_{stage}.json"
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
     return p
@@ -378,8 +378,8 @@ def write_cfg(branch_dir, cfg, stage):
 # 3) 训练 / 指标
 # ---------------------------------------------------------------------------
 def stage_script(stage):
-    return "code/training/pretrain_mae.py" if stage == "pretrain" else \
-           "code/training/finetune_multitask.py"
+    return "src/training/pretrain_mae.py" if stage == "pretrain" else \
+           "src/training/finetune_multitask.py"
 
 
 def launch(branch, branch_dir, stage, cfg_path, out_dir, args, log_path, cards,
@@ -701,7 +701,7 @@ def main():
         for name in BRANCHES:
             vals = {}
             for s in STAGES:
-                p = plan[name]["dir"] / "configs" / f"compare_{s}.json"
+                p = plan[name]["dir"] / "src" / "configs" / f"compare_{s}.json"
                 if p.exists():
                     vals[s] = int(load_json(p)["training"]["batch_size"])
             cached[name] = vals
@@ -742,7 +742,7 @@ def main():
     lr = {s: scaled_lr(common_bs[s], args.nproc, args.lr) for s in STAGES}
     if use_cfg_cache:  # 续训以配置里真实的 lr 为准（可能来自不同 --nproc 的旧运行）
         for s in STAGES:
-            vals = [float(load_json(plan[b]["dir"] / "configs" / f"compare_{s}.json")
+            vals = [float(load_json(plan[b]["dir"] / "src" / "configs" / f"compare_{s}.json")
                           ["training"]["lr"]) for b in BRANCHES]
             lr[s] = vals[0]
             if len(set(vals)) > 1:
@@ -759,7 +759,7 @@ def main():
             item = plan[name]
             out_dir = item["dir"] / "weights" / "compare"
             out_dir.mkdir(parents=True, exist_ok=True)
-            cfg_path = item["dir"] / "configs" / f"compare_{stage}.json"
+            cfg_path = item["dir"] / "src" / "configs" / f"compare_{stage}.json"
             if use_cfg_cache and cfg_path.exists():
                 log(f"[{name}/{stage}] 复用上次配置 {cfg_path.name}")
             else:

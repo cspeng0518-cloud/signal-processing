@@ -1,9 +1,9 @@
 """阶段二：单一共享基座多任务微调（protocol / modulation / parameter 联合训练）。
 
 用法:
-  python code/training/finetune_multitask.py --data_dir datasets --out_dir weights [--eval_test]
-  torchrun --nproc_per_node=N code/training/finetune_multitask.py --data_dir datasets
-  python code/training/finetune_multitask.py --smoke_steps 2                         # 冒烟
+  python src/training/finetune_multitask.py --data_dir datasets --out_dir weights [--eval_test]
+  torchrun --nproc_per_node=N src/training/finetune_multitask.py --data_dir datasets
+  python src/training/finetune_multitask.py --smoke_steps 2                         # 冒烟
 
 流程: 拟合/加载 ParamCodec -> 构建模型（无 MAE 解码器）-> 加载 mae_pretrained.pt 共享权重
       （主干 FA/MLA + 双流 tokenizer + 融合；Conformer neck 与任务头随机初始化）

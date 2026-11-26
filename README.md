@@ -57,25 +57,27 @@ IQ [B,1024,2]（512 点样本右侧补零）
 ## 快速开始
 
 ```bash
-pip install -r environment/requirements.txt
+pip install -r requirements.txt                              # 依赖（训练用的 torch 等见文件末尾注释）
 python -m pytest tests -q                                    # 单元测试（CPU，约 1 分钟）
 python utils/prepare_official.py                             # 官方数据 -> memmap（只需一次）
-python utils/measure_vram.py --config code/configs/default.json --find_max_bs  # 实测显存
-python code/training/pretrain_mae.py --smoke_steps 2         # 冒烟预训练
-python code/training/finetune_multitask.py --smoke_steps 2   # 冒烟微调
-python code/training/pretrain_mae.py --data_dir datasets --out_dir weights
-python code/training/finetune_multitask.py --data_dir datasets --out_dir weights --eval_test
-python code/infer.py --input datasets/01/rf_signal_sample_io_v1.0/rf_signal_sample_io_input_v1.0.parquet \
-                     --output out/test_predictions.jsonl
+python utils/measure_vram.py --config src/configs/default.json --find_max_bs  # 实测显存
+python src/training/pretrain_mae.py --smoke_steps 2         # 冒烟预训练
+python src/training/finetune_multitask.py --smoke_steps 2   # 冒烟微调
+python src/training/pretrain_mae.py --data_dir datasets --out_dir weights
+python src/training/finetune_multitask.py --data_dir datasets --out_dir weights --eval_test
+bash run.sh datasets/01/rf_signal_sample_io_v1.0/rf_signal_sample_io_input_v1.0.parquet out/pred.jsonl
 python utils/benchmark_latency.py --weights_dir weights
 ```
 
+`run.sh` 是评测服务固定入口（`bash run.sh <input.parquet> <output.jsonl>`，也支持 `INPUT/OUTPUT`
+环境变量与无参自动探测），输出 JSONL 行序与输入严格一致；镜像用根目录 `Dockerfile` 构建。
+
 ### 常用变体
 
-- **多卡**：`torchrun --nproc_per_node=8 code/training/pretrain_mae.py ...`（GPU 用 nccl，昇腾用 hccl，长度分桶多卡同样生效）
+- **多卡**：`torchrun --nproc_per_node=8 src/training/pretrain_mae.py ...`（GPU 用 nccl，昇腾用 hccl，长度分桶多卡同样生效）
 - **续训**：`--resume weights/mae_resume.pt` / `weights/finetune_resume.pt`
 - **跳过预训练**：微调加 `--from_mae weights/mae_pretrained.pt`
-- **批量网格搜索**：`python utils/gen_configs.py --d_model 512 768 1024 --n_layers 24 30` → `python utils/measure_vram.py --grid code/configs/grid.json --budget 76` → `python utils/run_grid.py`
+- **批量网格搜索**：`python utils/gen_configs.py --d_model 512 768 1024 --n_layers 24 30` → `python utils/measure_vram.py --grid src/configs/grid.json --budget 76` → `python utils/run_grid.py`
 - **300 step 对比**：覆盖 `epochs_pretrain=1, steps_per_epoch_pretrain=300, epochs_finetune=1, steps_per_epoch=300, ema_decay=0`（EMA 在 300 步内追不上原始权重）
 
 ### 重点核对的日志行
@@ -86,7 +88,7 @@ python utils/benchmark_latency.py --weights_dir weights
 
 ---
 
-## 配置说明（`code/configs/default.json` 常用键）
+## 配置说明（`src/configs/default.json` 常用键）
 
 | 键 | 默认 | 说明 |
 |---|---|---|
@@ -124,21 +126,55 @@ python utils/benchmark_latency.py --weights_dir weights
 ## 目录
 
 ```
-code/
-  infer.py                 统一推理入口（评测程序调用）
-  configs/default.json     默认配置（约 126M 参数）；grid.json 起始网格
-  models/                  foundation(组装/MAE) backbone(HybridEncoder) tokenizer(时域流)
-                           frequency(频域流+融合) dsp(物理前端) heads layers/ ops/(融合算子)
-  training/                pretrain_mae.py finetune_multitask.py trainer.py tasks.py common.py
-  utils/                   dataset augment param_codec optim metrics logger ...
-                           diagnose_val.py / bad_case_analysis.py（诊断）
-utils/                     prepare_official measure_vram gen_configs gen_ablation run_grid
-                           benchmark_latency profile_model export_onnx fit_param_codec
-weights/                   config.json model.safetensors param_codec.json（训练后生成）
-weights/best/              run_grid 批量训练的全局最佳（由 run_grid.py 自动覆盖）
-docker/Dockerfile          推理镜像
-docs/                      training_guide gpu_memory_analysis data_analysis_report ...
+Dockerfile                推理镜像（CUDA 12.8 + torch 2.9.0）
+run.sh                    评测服务固定入口（Parquet -> JSONL）
+requirements.txt          推理依赖；wheels/ 为离线安装包
+src/
+  infer/infer.py          统一推理入口（评测程序调用）
+  models/                 foundation(组装/MAE) backbone(HybridEncoder) tokenizer(时域流)
+                          frequency(频域流+融合) dsp(物理前端) heads layers/ ops/(融合算子)
+  training/               pretrain_mae.py finetune_multitask.py trainer.py tasks.py common.py
+  utils/                  dataset augment param_codec optim metrics logger ...
+                          diagnose_val.py / bad_case_analysis.py（诊断）
+  configs/                default.json（默认配置，约 126M 参数）；grid.json 起始网格
+config/                   运行环境配置（infer.json：设备/精度/批大小/权重目录）
+utils/                    prepare_official measure_vram gen_configs gen_ablation run_grid
+                          benchmark_latency profile_model export_onnx fit_param_codec
+weights/                  config.json model.safetensors param_codec.json（提交必需）
+datasets/                 官方数据与预处理产物（readme.txt 说明来源）
+docs/                     training_guide gpu_memory_analysis data_analysis_report ...
+figures/                  数据分析图（对应 docs/data_analysis_report.md）
+tests/                    单元测试（CPU 可跑：python -m pytest tests -q）
+logs/ output/             运行产物（训练日志、推理输出），不参与提交
 ```
+
+## 提交与补充材料
+
+| 路径 | 用途 | 是否必需 |
+|---|---|---|
+| `weights/model.safetensors` | 微调后最终权重（唯一推理权重） | 必需 |
+| `weights/config.json` | 该权重对应的模型配置（结构、seq_len、head 参数） | 必需 |
+| `weights/param_codec.json` | 参数归一化/解码统计量，缺失会导致参数输出失真 | 必需 |
+| `weights/mae_pretrained.pt` `mae_resume.pt` `finetune_resume.pt` | 训练中间产物（可复现训练用） | 非必需，可删 |
+| `datasets/*.zip`、`datasets/*.parquet`、`datasets/{task}/*.memmap` | 官方原始数据与预处理缓存 | 非必需，见 `datasets/readme.txt` |
+| `figures/` | `docs/data_analysis_report.md` 的配图 | 补充材料 |
+| `tests/` | 单元测试，验证算子/指标/数据管线 | 补充材料 |
+| `utils/` | 数据准备、显存实测、配置搜索、导出、时延基准等脚本 | 补充材料 |
+
+打包提交时排除 `logs/`、`output/`、`datasets/`（体积大且可重新生成）、`**/__pycache__`。
+
+## 权重与运行环境
+
+| 项 | 说明 |
+|---|---|
+| 权重文件 | `weights/model.safetensors`（safetensors，fp32，约 483 MB，126.53M 参数） |
+| 键格式 | 与 `build_model(cfg["model"], with_decoder=False)` 的 state_dict 一致 |
+| 配套文件 | `weights/config.json`（模型/训练配置）、`weights/param_codec.json`（参数编解码，缺失会导致参数输出单位错误） |
+| 加载方式 | `safetensors.torch.load_file` → `model.load_state_dict(..., strict=False)`，缺键/多键直接报错（`src/infer/infer.py:load_model`） |
+| 模型结构 | d_model=512、24 层（FA:MLA=1:2）、ffn=2048、neck=2、seq_len=1024、patch=8 |
+| 运行环境配置 | `config/infer.json`：`device`（auto/cuda/cpu）、`precision`（bf16/fp16/fp32）、`batch_size`、`weights_dir`；环境变量 `BATCH_SIZE` / `PRECISION` 可覆盖 |
+
+`src/configs/` 放的是**训练/模型超参**，`config/` 放的是**推理运行环境**，两者不要混用。
 
 ---
 
