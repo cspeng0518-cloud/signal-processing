@@ -10,6 +10,11 @@
   top_confusions.csv                最易混淆的 (真值, 预测) 对及占比
   acc_vs_snr.png / acc_vs_snr.csv   准确率随估计 SNR 分桶的变化（判断是否"低 SNR 天花板"）
   acc_vs_length.csv                 512 vs 1024 点准确率
+  acc_vs_nsym.csv / acc_vs_rateconf.csv / acc_vs_bw.csv
+                                    准确率随"观测窗内符号数"、码元速率估计置信度、占用带宽
+                                    分桶的变化（来自模型自己的信号前端统计量）
+  error_structure.csv               每类错误的"块内归一化熵"：≈1 表示错误均匀撒在同块各类
+                                    （样本本身缺信息），明显 <1 表示存在特定成对混淆
   acc_vs_confidence.png             置信度校准曲线
   bad_cases.csv                     全部错分样本（sample_id、真值、预测、置信度、SNR、长度）
   figs/<真值>__as__<预测>_*.png      每个高频混淆对抽 n_fig 个样本画 4 联图：
@@ -23,6 +28,8 @@
     高阶累积量是否可分，检查 dsp 前端的 CFO 估计是否失效；
   * 512 点样本显著更差 -> 观测长度不足，可考虑对 512 点样本加强增强或单独阈值；
   * 置信度高却错（过度自信）-> label smoothing / 温度校准 / 数据标签噪声排查。
+  * error_structure 熵≈1 且 acc 随 nsym 单调上升 -> "观测符号数不足"型天花板，加特征只能
+    逼近上限，不能突破；熵明显 <1 的类才是特征/模型可以针对性改进的成对混淆。
 """
 
 import argparse
@@ -38,6 +45,7 @@ import torch
 from torch.utils.data import DataLoader, Subset
 
 from training.common import ROOT
+from models.dsp import STAT_NAMES
 from utils.dataset import ID2LABEL, collate_fn, make_task_dataset
 from utils.train_utils import autocast_context, get_device
 
@@ -57,9 +65,14 @@ def estimate_snr_db(iq):
     return float(10 * np.log10(sig / (floor * len(sm)) + 1e-6)), int(L)
 
 
+FRONT_KEYS = ("log_nsym", "rate_conf", "occupied_bw", "sym_rate", "snr")
+
+
 def run(model, ds, task, device, bs=512):
+    """返回 (真值, 预测, 置信度, sample_id, 前端统计量 dict[name -> np.ndarray])。"""
     loader = DataLoader(ds, batch_size=bs, collate_fn=collate_fn, num_workers=2)
-    ys, ps, conf, ids = [], [], [], []
+    ys, ps, conf, ids, fst = [], [], [], [], []
+    idx = [STAT_NAMES.index(k) for k in FRONT_KEYS]
     model.eval()
     with torch.inference_mode(), autocast_context(device, True):
         for b in loader:
@@ -67,11 +80,59 @@ def run(model, ds, task, device, bs=512):
             logits = model.head_outputs(iq, task)
             pr = logits.float().softmax(-1)
             c, p = pr.max(-1)
+            st = model.front(iq)["stats"][:, idx].float()
+            fst.append((torch.sign(st) * torch.expm1(st.abs())).cpu().numpy())   # 反 symlog
             ys.append(b["label"].numpy())
             ps.append(p.cpu().numpy())
             conf.append(c.cpu().numpy())
             ids += list(b["sample_id"])
-    return np.concatenate(ys), np.concatenate(ps), np.concatenate(conf), ids
+    fst = np.concatenate(fst)
+    front = {k: fst[:, i] for i, k in enumerate(FRONT_KEYS)}
+    front["sym_rate"] = front["sym_rate"] / 10
+    front["nsym"] = np.power(10.0, front.pop("log_nsym")) - 1
+    return np.concatenate(ys), np.concatenate(ps), np.concatenate(conf), ids, front
+
+
+def error_structure(cm, names):
+    """每类错误分布的归一化熵（只在"实际被混淆到的类"构成的块内计算）。
+
+    块 = 该类曾被预测成的类集合（连通分量），反映数据集天然分块（如 14 类数字通信 /
+    4 类 / 5 类雷达）。返回 [(类名, 错误率, 块大小, 归一化熵)]。
+    """
+    C = len(names)
+    adj = (cm + cm.T) > 0
+    comp = -np.ones(C, dtype=int)
+    for s0 in range(C):
+        if comp[s0] >= 0:
+            continue
+        stack, comp[s0] = [s0], s0
+        while stack:
+            u = stack.pop()
+            for v in np.where(adj[u])[0]:
+                if comp[v] < 0:
+                    comp[v] = s0
+                    stack.append(v)
+    rows = []
+    for i in range(C):
+        blk = [j for j in range(C) if comp[j] == comp[i] and j != i]
+        e = cm[i, blk].astype(float)
+        err = e.sum() / max(1, cm[i].sum())
+        if len(blk) < 2 or e.sum() == 0:
+            rows.append((names[i], err, len(blk) + 1, float("nan")))
+            continue
+        q = e / e.sum()
+        H = -(q[q > 0] * np.log(q[q > 0])).sum() / np.log(len(blk))
+        rows.append((names[i], err, len(blk) + 1, float(H)))
+    return rows
+
+
+def _bucket_rows(v, y, p, edges):
+    rows = []
+    for lo, hi in zip(edges[:-1], edges[1:]):
+        m = (v >= lo) & (v < hi)
+        if m.any():
+            rows.append((f"[{lo},{hi})", int(m.sum()), float((y[m] == p[m]).mean())))
+    return rows
 
 
 def plot_case(iq, title, path):
@@ -136,7 +197,7 @@ def main():
     out = Path(args.out or ROOT / "logs" / "bad_case" / args.task)
     (out / "figs").mkdir(parents=True, exist_ok=True)
 
-    y, p, conf, ids = run(model, ds, args.task, device)
+    y, p, conf, ids, front = run(model, ds, args.task, device)
     acc = float((y == p).mean())
     cm = np.zeros((C, C), dtype=np.int64)
     np.add.at(cm, (y, p), 1)
@@ -187,10 +248,32 @@ def main():
             w.writerow([int(ln), int(m.sum()), f"{(y[m] == p[m]).mean():.4f}"])
     with open(out / "bad_cases.csv", "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
-        w.writerow(["sample_id", "true", "pred", "conf", "snr_db", "length"])
+        w.writerow(["sample_id", "true", "pred", "conf", "snr_db", "length",
+                    "nsym_est", "rate_conf", "occupied_bw"])
         for k in np.where(y != p)[0]:
             w.writerow([ids[k], names[y[k]], names[p[k]], f"{conf[k]:.4f}", f"{snr[k]:.2f}",
-                        int(lens[k])])
+                        int(lens[k]), f"{front['nsym'][k]:.1f}", f"{front['rate_conf'][k]:.3f}",
+                        f"{front['occupied_bw'][k]:.4f}"])
+    # --- 前端统计量分桶：观测符号数 / 速率置信度 / 占用带宽 ---
+    buckets = {
+        "nsym": [0, 16, 32, 64, 128, 256, 512, np.inf],
+        "rateconf": [-np.inf, 0.8, 1.0, 1.2, 1.5, 2.0, np.inf],
+        "bw": [0, 0.02, 0.05, 0.1, 0.2, 0.4, 1.01],
+    }
+    src = {"nsym": front["nsym"], "rateconf": front["rate_conf"], "bw": front["occupied_bw"]}
+    bucket_rows = {}
+    for name, edges in buckets.items():
+        bucket_rows[name] = _bucket_rows(src[name], y, p, edges)
+        with open(out / f"acc_vs_{name}.csv", "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow([f"{name}_bin", "n", "acc"])
+            w.writerows(bucket_rows[name])
+    es = error_structure(cm, names)
+    with open(out / "error_structure.csv", "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["class", "error_rate", "block_size", "block_entropy_norm"])
+        for r in es:
+            w.writerow([r[0], f"{r[1]:.4f}", r[2], f"{r[3]:.3f}"])
 
     # --- 图 ---
     import matplotlib
@@ -257,7 +340,19 @@ def main():
              "", "## Top 混淆对", ""]
     for c, i, j in off[:10]:
         lines.append(f"- {names[i]} → {names[j]}: {c} 条（占该类 {cmn[i, j]:.1%}，占全部错误 {c / n_err:.1%}）")
+    lines += ["", "## 错误结构（块内归一化熵，≈1 = 错误均匀撒开 / 样本缺信息）", ""]
+    for r in es:
+        if r[1] > 0.05 and not np.isnan(r[3]):
+            kind = "均匀(缺信息)" if r[3] > 0.9 else ("偏均匀" if r[3] > 0.8 else "成对混淆")
+            lines.append(f"- {r[0]}: 错误率 {r[1]:.1%}，块大小 {r[2]}，熵 {r[3]:.2f} -> {kind}")
+    lines += ["", "## 准确率 vs 观测窗内符号数（前端估计）", ""]
+    for b in bucket_rows["nsym"]:
+        lines.append(f"- nsym {b[0]}: n={b[1]}, acc={b[2]:.4f}")
     lines += ["", "## 判读", ""]
+    diffuse = [r for r in es if r[1] > 0.2 and not np.isnan(r[3]) and r[3] > 0.9]
+    if diffuse:
+        lines.append(f"- {len(diffuse)} 个类错误率 >20% 且块内熵 >0.9：错误主要是\"样本缺可分信息\""
+                     "而非特定两类相像；对照 acc_vs_nsym 看是否为观测符号数不足型天花板。")
     if hi.any() and (y[hi] == p[hi]).mean() > 0.95 and lo.any() and (y[lo] == p[lo]).mean() < 0.6:
         lines.append("- 错误主要来自低 SNR 样本：属于可分性天花板，优先降噪（带外抑制）、增强、TTA。")
     else:

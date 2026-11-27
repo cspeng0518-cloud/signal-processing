@@ -4,8 +4,9 @@
 
     [CLS] [STAT] [TIME_1 .. TIME_P]
       |      |          |
-    全局读出  16 维统计量  多通道卷积 stem（I,Q,校正后 I/Q,包络,瞬时频率）
-    (+任务提示)          ⊕ 门控融合的同帧 STFT 谱（通道级时-频对齐融合）
+    全局读出  统计量      多通道卷积 stem（10 通道：I,Q,精校正 I/Q,包络,瞬时频率,
+    (+任务提示) (40 维)   平滑瞬时频率,调频率,延迟共轭积 I/Q，见 dsp.TIME_CHANNELS）
+                         ⊕ 门控融合的同帧 STFT 谱（通道级时-频对齐融合）
 
   * 位置信息：不叠加绝对位置编码，由主干 RoPE 按 token 下标旋转 q/k
     （前缀占位置 0、1，时域 token 从 2 开始）；MAE 只编码可见 token 时传原始下标。
@@ -17,7 +18,7 @@
 import torch
 import torch.nn as nn
 
-from .dsp import N_STATS
+from .dsp import N_STATS, TIME_CHANNELS
 
 N_PREFIX = 2                                   # [CLS] + [STAT]
 TASK_IDS = {"protocol": 0, "modulation": 1, "parameter": 2}
@@ -68,7 +69,8 @@ class GatedChannelFusion(nn.Module):
 
 class TimeTokenizer(nn.Module):
     def __init__(self, d_model=512, patch_size=8, stft_win=32, stem_width=64,
-                 n_time_channels=6, use_stft=True, use_stats=True, task_prompt=True):
+                 n_time_channels=len(TIME_CHANNELS), use_stft=True, use_stats=True,
+                 task_prompt=True, n_stats=N_STATS):
         super().__init__()
         self.patch = patch_size
         self.use_stft = use_stft
@@ -79,7 +81,7 @@ class TimeTokenizer(nn.Module):
             self.stft_proj = nn.Sequential(nn.Linear(stft_win, d_model), nn.LayerNorm(d_model))
             self.fuse = GatedChannelFusion(d_model)
         if use_stats:
-            self.stat_proj = nn.Sequential(nn.Linear(N_STATS, d_model), nn.GELU(),
+            self.stat_proj = nn.Sequential(nn.Linear(n_stats, d_model), nn.GELU(),
                                            nn.Linear(d_model, d_model), nn.LayerNorm(d_model))
         else:
             self.stat_token = nn.Parameter(torch.zeros(1, 1, d_model))

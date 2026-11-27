@@ -5,8 +5,9 @@
           IQ [B,N,2]
               │
       SignalFrontEnd（dsp.py，物理先验前端，无参数，fp32）
-        ├── 时域多通道 / STFT / 统计量 ─────► TimeTokenizer ──► [CLS][STAT][TIME×T]
-        └── 非线性谱 / 包络 ACF / 星座图 ─► FrequencyStream ──► [FREQ×Lf]
+        ├── 时域 10 通道 / STFT / 40 维统计量 ─────────► TimeTokenizer ──► [CLS][STAT][TIME×T]
+        └── 非线性谱+共轭循环谱 / 循环自相关 CAF / 去斜谱 /
+            包络+复自相关 / 三通道星座图 / 分布直方图 ──► FrequencyStream ──► [FREQ×Lf]
                                                    │
               CrossDomainFusion（时域 query ← 频域 key/value，门控残差）
                                                    │
@@ -37,7 +38,8 @@ import torch
 import torch.nn as nn
 
 from .backbone import HybridEncoder
-from .dsp import SignalFrontEnd
+from .dsp import (DEFAULT_CAF_LAGS, DEFAULT_CCAF_LAGS, DEFAULT_DECHIRP_RATES,
+                  SignalFrontEnd)
 from .frequency import CrossDomainFusion, FrequencyStream
 from .heads import ClsHead, ParamHead
 from .layers.hybrid import CONTIGUOUS_ONLY, normalize_layer_type
@@ -106,19 +108,32 @@ class EMFoundation(nn.Module):
 
         # ---------------- 共享：前端 + 双流 tokenizer + 融合 ----------------
         acf_lags = c.get("acf_lags", self.seq_len // 2)
-        self.front = SignalFrontEnd(self.seq_len, self.patch, stft_win, acf_lags,
-                                    c.get("const_bins", 32), dft_impl=c.get("dft_impl", "matmul"),
-                                    length_quantum=c.get("length_quantum", 512))
+        use_dechirp = c.get("use_dechirp", True)
+        self.front = SignalFrontEnd(
+            self.seq_len, self.patch, stft_win, acf_lags,
+            const_bins=c.get("const_bins", 64), const_range=c.get("const_range", 2.5),
+            dft_impl=c.get("dft_impl", "matmul"),
+            length_quantum=c.get("length_quantum", 512),
+            caf_lags=c.get("caf_lags", DEFAULT_CAF_LAGS),
+            ccaf_lags=c.get("ccaf_lags", DEFAULT_CCAF_LAGS),
+            dechirp_rates=c.get("dechirp_rates", DEFAULT_DECHIRP_RATES) if use_dechirp else (),
+            dechirp_pool=c.get("dechirp_pool", 2), hist_bins=c.get("hist_bins", 64),
+            dcmp_lag=c.get("dcmp_lag", 4), if_smooth=c.get("if_smooth", 5),
+            min_symbols=c.get("min_symbols", 4), cyc_whiten=c.get("cyc_whiten", 31),
+            fine_cfo_bins=c.get("fine_cfo_bins", 12.0))
         self.tokenizer = TimeTokenizer(
             d, self.patch, stft_win, c.get("stem_width", 64), self.front.n_time_channels,
             use_stft=c.get("use_stft", True), use_stats=c.get("use_stats", True),
-            task_prompt=c.get("task_prompt", True))
+            task_prompt=c.get("task_prompt", True), n_stats=self.front.n_stats)
         self.freq_stream = FrequencyStream(
-            d, nhead, self.seq_len, n_layers=c.get("freq_layers", 2), dim_feedforward=ffn,
-            dropout=dropout, spec_tokens=c.get("spec_tokens", 32), acf_lags=acf_lags,
-            acf_tokens=c.get("acf_tokens", 16), const_bins=c.get("const_bins", 32),
-            const_patch=c.get("const_patch", 8), use_spec=c.get("use_spec", True),
-            use_acf=c.get("use_acf", True), use_const=c.get("use_const", True))
+            d, nhead, self.front.view_shapes(),
+            tokens={"spec": c.get("spec_tokens", 32), "caf": c.get("caf_tokens", 16),
+                    "dechirp": c.get("dechirp_tokens", 16), "acf": c.get("acf_tokens", 16)},
+            const_patch=c.get("const_patch", 16),
+            use={"spec": c.get("use_spec", True), "acf": c.get("use_acf", True),
+                 "const": c.get("use_const", True), "caf": c.get("use_caf", True),
+                 "dechirp": use_dechirp, "hist": c.get("use_hist", True)},
+            n_layers=c.get("freq_layers", 2), dim_feedforward=ffn, dropout=dropout)
         self.fusion = CrossDomainFusion(d, nhead, dropout=0.0)
 
         # ---------------- 共享：预训练主干（FA + MLA） ----------------

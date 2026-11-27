@@ -4,7 +4,8 @@
 
 - **预训练主干**：FA : MLA = 1 : 2 混合 Transformer（RoPE，SDPA/NPU 融合注意力），MAE 只编码可见 token（省显存）
 - **微调主干**：预训练主干 + Conformer neck（默认 2 层，补充局部波形建模）
-- **时-频融合**：物理先验前端 → 时域流（ConvStem ⊕ 门控 STFT）+ 频域流（非线性谱/包络 ACF/星座）→ 跨注意力门控融合
+- **时-频融合**：物理先验前端 → 时域流（10 通道 ConvStem ⊕ 门控 STFT）+ 频域流（非线性谱+共轭循环谱 / 循环自相关 CAF / 去斜谱 / 复自相关 / 三通道星座 / 分布直方图）→ 跨注意力门控融合
+- **符号级物理先验**：白化循环谱估码元速率 → Oerder–Meyr 定时 → M 次方精频偏去旋转 → 符号同步星座、符号域高阶累积量（详见 [docs/frontend_upgrade.md](docs/frontend_upgrade.md)）
 - **多任务优化**：任务提示 + 任务专属注意力池化；三任务梯度累加单步更新；PCGrad / 不确定性加权可选；EMA
 - **国产化/效率**：纯 PyTorch，无 CUDA 专有依赖；融合算子自检回退（CUDA SDPA/Triton、昇腾 npu_fusion_attention/npu_swiglu）；DFT 用实数矩阵乘（NPU/ONNX 友好）；长度分桶 + 补零裁剪；bf16
 
@@ -18,11 +19,14 @@
 IQ [B,1024,2]（512 点样本右侧补零）
   │
   SignalFrontEnd（dsp.py，物理先验，无参数，fp32）
-  ├─ 时域多通道(I,Q,校正I/Q,包络,瞬时频率) + 对齐 STFT + 16 维统计量
+  ├─ 码元速率(白化循环谱) -> 符号同步(Oerder–Meyr) -> M 次方精频偏/相位去旋转
+  ├─ 时域 10 通道(I,Q,精校正I/Q,包络,瞬时频率,平滑瞬时频率,调频率,延迟共轭积I/Q)
+  │  + 对齐 STFT + 40 维统计量（含 ρ2/4/8、符号域 C40~C80、观测符号数、去斜增益、PSL）
   │     └─ TimeTokenizer：ConvStem ⊕ 门控 STFT（通道级融合） -> [CLS(+任务提示)][STAT][TIME×T]
   │                                                        (512 点 T=64, 1024 点 T=128)
-  └─ |X|,|X²|,|X⁴| 非线性谱 + 包络 ACF + 星座密度
-        └─ FrequencyStream：SpectralTokenizer + 2 层自注意力 -> [FREQ×64]（固定长度）
+  └─ SPEC(|X|,|X²|,|X⁴|,共轭循环谱) ×32 + CAF ×16 + 去斜谱 ×16 + ACF(包络+复自相关) ×16
+     + 三通道星座(全部/稳定点/符号点 64×64) ×16 + 直方图 ×6
+        └─ FrequencyStream：SpectralTokenizer + 2 层自注意力 -> [FREQ×102]（固定长度）
   │
   CrossDomainFusion：时域 query ← 频域 key/value，门控残差
   │                 （频域 token 用完即弃，不进主干序列）
@@ -58,7 +62,8 @@ IQ [B,1024,2]（512 点样本右侧补零）
 
 ```bash
 pip install -r requirements.txt                              # 依赖（训练用的 torch 等见文件末尾注释）
-python -m pytest tests -q                                    # 单元测试（CPU，约 1 分钟）
+python -m pytest tests -q                                    # 单元测试（CPU，约 1 分钟；含前端物理特征回归）
+python utils/probe_features.py --task modulation             # 前端特征可分性探针（不训练主干，几分钟）
 python utils/prepare_official.py                             # 官方数据 -> memmap（只需一次）
 python utils/measure_vram.py --config src/configs/default.json --find_max_bs  # 实测显存
 python src/training/pretrain_mae.py --smoke_steps 2         # 冒烟预训练
@@ -98,6 +103,11 @@ python utils/benchmark_latency.py --weights_dir weights
 | `model.neck_with_freq` | true | neck 序列尾部是否拼接频域 token |
 | `model.grad_checkpoint` | false | 逐层激活重计算，显存约降到 1/3，速度约慢 30% |
 | `model.freq_layers` | 2 | 频域流自注意力层数，0 = 只做线性投影 |
+| `model.use_caf` / `use_dechirp` / `use_hist` | true | 循环自相关 / 去斜谱 / 直方图视图开关（消融 A7~A9） |
+| `model.caf_lags` / `ccaf_lags` | `[0,1,2,4,8,16,32]` / `[1,2,4,8]` | 非共轭 / 共轭循环谱滞后集合（`ccaf_lags: []` 关闭共轭循环谱） |
+| `model.dechirp_rates` | 19 路 ±1/16~±2 | 去斜候选调频率（N 点内扫过的 cycles/sample），自动含 0 |
+| `model.const_bins` / `const_patch` | 64 / 16 | 三通道星座图分辨率与 patch |
+| `model.fine_cfo_bins` | 12 | 符号域精频偏搜索范围（bin，另封顶 0.25 cycles/symbol） |
 | `model.mae_decoder_dim` / `model.mae_decoder_layers` | 256 / 2 | MAE 解码器规模，仅预训练 |
 | `model.mask_ratio` | 0.75 | MAE 掩码率 |
 | `training.batch_size_pretrain` / `training.batch_size` | 512 / 256 | 预训练/微调 batch |
@@ -135,10 +145,10 @@ src/
                           frequency(频域流+融合) dsp(物理前端) heads layers/ ops/(融合算子)
   training/               pretrain_mae.py finetune_multitask.py trainer.py tasks.py common.py
   utils/                  dataset augment param_codec optim metrics logger ...
-                          diagnose_val.py / bad_case_analysis.py（诊断）
+                          diagnose_val.py / bad_case_analysis.py（诊断：混淆块熵、acc vs 符号数）
   configs/                default.json（默认配置，约 126M 参数）；grid.json 起始网格
 config/                   运行环境配置（infer.json：设备/精度/批大小/权重目录）
-utils/                    prepare_official measure_vram gen_configs gen_ablation run_grid
+utils/                    prepare_official measure_vram gen_configs gen_ablation run_grid probe_features
                           benchmark_latency profile_model export_onnx fit_param_codec
 weights/                  config.json model.safetensors param_codec.json（提交必需）
 datasets/                 官方数据与预处理产物（readme.txt 说明来源）

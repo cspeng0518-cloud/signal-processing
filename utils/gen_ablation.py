@@ -22,12 +22,16 @@ ABLATIONS = [
     # === A: 任务 1 时-频双流 / 融合消融 ===
     ("A0_time_only",   "仅时域单流（关闭 STFT 门控、频域流、统计 token）",
      {"model": {"use_stft": False, "use_spec": False, "use_acf": False, "use_const": False,
-                "use_stats": False}}),
+                "use_caf": False, "use_dechirp": False, "use_hist": False, "use_stats": False}}),
     ("A1_no_stft",     "去掉通道级 STFT 门控融合",   {"model": {"use_stft": False}}),
     ("A2_no_spec",     "频域流去掉非线性谱 token",     {"model": {"use_spec": False}}),
-    ("A3_no_acf",      "频域流去掉包络自相关 token",   {"model": {"use_acf": False}}),
+    ("A3_no_acf",      "频域流去掉包络/复自相关 token",   {"model": {"use_acf": False}}),
     ("A4_no_const",    "频域流去掉星座图 token",       {"model": {"use_const": False}}),
     ("A5_no_stats",    "去掉统计量 token",             {"model": {"use_stats": False}}),
+    ("A7_no_caf",      "频域流去掉非共轭循环自相关 token", {"model": {"use_caf": False}}),
+    ("A8_no_dechirp",  "关闭去斜谱（前端不计算，统计量置 0）", {"model": {"use_dechirp": False}}),
+    ("A9_no_hist",     "频域流去掉分布直方图 token",   {"model": {"use_hist": False}}),
+    ("A10_no_ccaf",    "spec 不叠加共轭循环谱通道",    {"model": {"ccaf_lags": []}}),
     ("A6_freq_enc0",   "频域流不加自注意力编码（仅投影）", {"model": {"freq_layers": 0}}),
 
     # === B: 主干 / neck 消融 ===

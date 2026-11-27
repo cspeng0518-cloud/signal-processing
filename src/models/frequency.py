@@ -1,20 +1,24 @@
 """频域流 + 跨域融合（时-频双流中的“频域流”，对应赛题任务 1）
 
-频域 token（全部来自信号前端 SignalFrontEnd，物理先验、无可学习参数的部分）:
-  SPEC  ×spec_tokens   全局对数谱 |X|、|FFT(x²)|、|FFT(x⁴)| 按同一频点堆叠为一个 token
-                       （空间级对齐：3 个非线性谱在频点维对齐；x²/x⁴ 谱线揭示 PSK/QAM 阶数）
-  ACF   ×acf_tokens    包络自相关（PRI / 脉冲数 / 占空比的强线索）
-  CONST ×const_tokens  载频校正后星座密度图的 2D patch（QAM/PSK 阶数）
-每类 token 有独立的可学习位置编码与模态类型编码。
+频域 token（全部来自信号前端 SignalFrontEnd 的确定性物理视图，见 models/dsp.py）:
+  SPEC    ×spec_tokens     |X|、|FFT(x²)|、|FFT(x⁴)|、共轭循环谱 |FFT(x[n]x[n-d])|，
+                           同一频点的各通道拼成一个 token（频点维空间对齐）
+  CAF     ×caf_tokens      非共轭循环自相关相干度 c_d(α)，α∈[0,0.5)，各滞后按 α 对齐拼接
+                           （码元速率谱线、OQPSK/MSK/FSK 的循环平稳结构、雷达 1/PRI）
+  DECHIRP ×dechirp_tokens  去斜谱：19 个候选调频率 × 频率（LFM/CSS 聚焦，Frank 部分聚焦）
+  ACF     ×acf_tokens      包络 ACF + 复自相关 |R|、Re R、Im R（PRI / 脉冲数 / 相位编码）
+  CONST   ×(G/p)²          三通道星座图（全部采样点 / 稳定点 / 符号同步点）的 2D patch
+  HIST    ×6               分布直方图（平滑瞬时频率 / 延迟相位差 / 符号相位差 /
+                           采样幅度 / 符号幅度环 / 符号相位），每个直方图一个 token
+每类 token 有独立的可学习位置编码与模态类型编码。各视图的通道数/轴长由
+SignalFrontEnd.view_shapes() 给出，tokenizer 不硬编码前端细节。
 
-FrequencyEncoder：频域 token 上的小型自注意力编码器（freq_layers 层，默认 2），
-                  频域流自己的“编码”，与时域主干并行。
+FrequencyEncoder：频域 token 上的小型自注意力编码器（freq_layers 层，默认 2）。
 CrossDomainFusion：时域 token（含 CLS/STAT）作 query、频域 token 作 key/value 的
                   跨注意力 + 门控残差（注意力级动态对齐融合）。融合发生在主干之前，
-                  频域 token 不进入主干序列 -> 主干序列长度不变，显存不涨。
+                  频域 token 不进入主干序列 -> 主干序列长度不变。
 
-预训练防泄漏：MAE 时前端输入的是“被掩码采样点置零”的信号，频域 token 只看到可见
-部分；否则整段 FFT（幅度+相位无损）会把被掩码内容泄漏给可见 token（旧版缺陷）。
+预训练防泄漏：MAE 时前端输入的是“被掩码采样点置零”的信号，频域 token 只看到可见部分。
 """
 
 import torch
@@ -23,44 +27,63 @@ import torch.nn as nn
 from .layers.attention import CrossAttention, MultiHeadAttention
 from .layers.hybrid import AttentionLayer
 
-FREQ_TYPES = {"spec": 0, "acf": 1, "const": 2}
+FREQ_TYPES = {"spec": 0, "acf": 1, "const": 2, "caf": 3, "dechirp": 4, "hist": 5}
+MAP_VIEWS = ("spec", "caf", "dechirp", "acf")          # [B,C,M] -> 沿 M 切 token
 
 
 class SpectralTokenizer(nn.Module):
-    def __init__(self, d_model=512, seq_len=1024, spec_tokens=32, acf_lags=512, acf_tokens=16,
-                 const_bins=32, const_patch=8, use_spec=True, use_acf=True, use_const=True):
+    """把前端各视图切成 token 并投影到 d_model。
+
+    Args:
+        view_shapes: SignalFrontEnd.view_shapes()
+        tokens:      {"spec": n, "caf": n, "dechirp": n, "acf": n}，每个 1D 视图的 token 数
+        const_patch: 星座图 2D patch 边长
+        use:         {视图名: bool} 开关（关闭的视图不建参数、不出 token）
+    """
+
+    def __init__(self, d_model, view_shapes, tokens, const_patch=16, use=None):
         super().__init__()
-        self.use = dict(spec=use_spec, acf=use_acf, const=use_const)
-        if use_spec:
-            if seq_len % spec_tokens:
-                raise ValueError(f"seq_len={seq_len} 必须能被 spec_tokens={spec_tokens} 整除")
-            self.spec_tokens = spec_tokens
-            self.spec_proj = nn.Sequential(nn.Linear(3 * seq_len // spec_tokens, d_model),
-                                           nn.LayerNorm(d_model))
-            self.pos_spec = nn.Parameter(torch.zeros(1, spec_tokens, d_model))
-        if use_acf:
-            if acf_lags % acf_tokens:
-                raise ValueError(f"acf_lags={acf_lags} 必须能被 acf_tokens={acf_tokens} 整除")
-            self.acf_tokens = acf_tokens
-            self.acf_proj = nn.Sequential(nn.Linear(acf_lags // acf_tokens, d_model),
-                                          nn.LayerNorm(d_model))
-            self.pos_acf = nn.Parameter(torch.zeros(1, acf_tokens, d_model))
-        if use_const:
-            if const_bins % const_patch:
+        use = dict(use or {})
+        self.use = {k: bool(use.get(k, True)) and view_shapes.get(k) is not None
+                    for k in FREQ_TYPES}
+        self.n_tok = {}
+        self.proj = nn.ModuleDict()
+        self.pos = nn.ParameterDict()
+        for k in MAP_VIEWS:
+            if not self.use[k]:
+                continue
+            C, M = view_shapes[k]
+            T = int(tokens[k])
+            if M % T:
+                raise ValueError(f"{k}: 轴长 {M} 必须能被 token 数 {T} 整除")
+            self.n_tok[k] = T
+            self.proj[k] = nn.Sequential(nn.Linear(C * (M // T), d_model), nn.LayerNorm(d_model))
+            self.pos[k] = nn.Parameter(torch.zeros(1, T, d_model))
+        if self.use["const"]:
+            C, G = view_shapes["const"]
+            if G % const_patch:
                 raise ValueError("const_bins 必须能被 const_patch 整除")
             self.cp = const_patch
-            self.n_const = (const_bins // const_patch) ** 2
-            self.const_proj = nn.Sequential(nn.Linear(const_patch * const_patch, d_model),
-                                            nn.LayerNorm(d_model))
-            self.pos_const = nn.Parameter(torch.zeros(1, self.n_const, d_model))
+            self.n_tok["const"] = (G // const_patch) ** 2
+            self.proj["const"] = nn.Sequential(nn.Linear(C * const_patch * const_patch, d_model),
+                                               nn.LayerNorm(d_model))
+            self.pos["const"] = nn.Parameter(torch.zeros(1, self.n_tok["const"], d_model))
+        if self.use["hist"]:
+            H, bins = view_shapes["hist"]
+            self.n_tok["hist"] = H
+            self.proj["hist"] = nn.Sequential(nn.Linear(bins, d_model), nn.LayerNorm(d_model))
+            self.pos["hist"] = nn.Parameter(torch.zeros(1, H, d_model))
         self.type_embed = nn.Embedding(len(FREQ_TYPES), d_model)
-        for name in ("pos_spec", "pos_acf", "pos_const"):
-            if hasattr(self, name):
-                nn.init.trunc_normal_(getattr(self, name), std=0.02)
+        for p in self.pos.values():
+            nn.init.trunc_normal_(p, std=0.02)
 
     @property
     def enabled(self):
-        return any(self.use.values())
+        return len(self.n_tok) > 0
+
+    @property
+    def n_tokens(self):
+        return sum(self.n_tok.values())
 
     def _typed(self, x, kind):
         return x + self.type_embed.weight[FREQ_TYPES[kind]]
@@ -68,19 +91,23 @@ class SpectralTokenizer(nn.Module):
     def forward(self, fe):
         """fe: SignalFrontEnd 输出 dict -> [B, Lf, d]（全部视图关闭时返回 None）。"""
         parts = []
-        B = fe["spec"].size(0)
-        if self.use["spec"]:
-            sp = fe["spec"].reshape(B, 3, self.spec_tokens, -1).permute(0, 2, 1, 3).reshape(
-                B, self.spec_tokens, -1)
-            parts.append(self._typed(self.spec_proj(sp) + self.pos_spec, "spec"))
-        if self.use["acf"]:
-            ac = fe["acf"].reshape(B, self.acf_tokens, -1)
-            parts.append(self._typed(self.acf_proj(ac) + self.pos_acf, "acf"))
-        if self.use["const"]:
-            G, p = fe["const"].size(-1), self.cp
-            c = fe["const"].reshape(B, G // p, p, G // p, p).permute(0, 1, 3, 2, 4).reshape(
-                B, self.n_const, p * p)
-            parts.append(self._typed(self.const_proj(c) + self.pos_const, "const"))
+        dt = self.type_embed.weight.dtype
+        for k in ("spec", "caf", "dechirp", "acf", "const", "hist"):
+            if k not in self.n_tok:
+                continue
+            v = fe[k]
+            B = v.size(0)
+            if k in MAP_VIEWS:                                   # [B,C,M] -> [B,T,C*M/T]
+                C, M = v.shape[1], v.shape[2]
+                T = self.n_tok[k]
+                tok = v.reshape(B, C, T, M // T).permute(0, 2, 1, 3).reshape(B, T, -1)
+            elif k == "const":                                   # [B,C,G,G] -> [B,(G/p)²,C*p*p]
+                C, G, p = v.shape[1], v.shape[2], self.cp
+                tok = v.reshape(B, C, G // p, p, G // p, p).permute(0, 2, 4, 1, 3, 5).reshape(
+                    B, (G // p) ** 2, C * p * p)
+            else:                                                # hist [B,H,bins]
+                tok = v
+            parts.append(self._typed(self.proj[k](tok.to(dt)) + self.pos[k], k))
         if not parts:
             return None
         return torch.cat(parts, dim=1)
@@ -107,10 +134,10 @@ class FrequencyEncoder(nn.Module):
 class FrequencyStream(nn.Module):
     """SpectralTokenizer -> FrequencyEncoder，输出频域记忆 token [B, Lf, d]。"""
 
-    def __init__(self, d_model, nhead, seq_len, n_layers=2, dim_feedforward=None,
-                 dropout=0.1, **tok_kwargs):
+    def __init__(self, d_model, nhead, view_shapes, tokens, const_patch=16, use=None,
+                 n_layers=2, dim_feedforward=None, dropout=0.1):
         super().__init__()
-        self.tokenizer = SpectralTokenizer(d_model, seq_len, **tok_kwargs)
+        self.tokenizer = SpectralTokenizer(d_model, view_shapes, tokens, const_patch, use)
         self.encoder = FrequencyEncoder(d_model, nhead, n_layers, dim_feedforward, dropout) \
             if n_layers > 0 else None
 

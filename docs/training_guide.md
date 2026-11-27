@@ -93,6 +93,17 @@ python utils/profile_model.py --weights_dir weights               # 算子热点
 python utils/export_onnx.py --weights_dir weights                 # ONNX -> ATC / TensorRT
 ```
 
+
+### 前端升级后的推荐诊断顺序
+
+1. `python utils/probe_features.py --task modulation`：只跑无参数前端 + 梯度提升树，按特征组
+   （base16 / stats40 / +hist / +const / all）对比可分性。组间差值即新特征的边际信息量；
+   若某类探针也只有 ~50% 且随观测符号数单调上升，说明是数据天花板。
+2. 重新 MAE 预训练 + 微调（前端输入维度已变化，旧权重不可复用）。
+3. `python src/utils/bad_case_analysis.py --task modulation`：看 `error_structure.csv`
+   （块内熵≈1 = 缺信息型错误，<0.8 = 成对混淆）与 `acc_vs_nsym.csv`。
+4. 消融：`python utils/gen_ablation.py --filter A` 生成 A7~A10（去掉 CAF / 去斜 / 直方图 / 共轭循环谱）。
+
 ## 5. 批量网格
 
 ```bash

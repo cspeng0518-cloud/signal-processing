@@ -49,7 +49,9 @@ def load_model(weights_dir, device):
     sd = {(k[len("model."):] if k.startswith("model.") else k): v for k, v in sd.items()}
     missing, unexpected = model.load_state_dict(sd, strict=False)
     if missing or unexpected:
-        raise RuntimeError(f"权重与配置不匹配: missing={missing[:5]} unexpected={unexpected[:5]}")
+        raise RuntimeError(f"权重与配置不匹配: missing={missing[:5]} unexpected={unexpected[:5]}。"
+                           "若权重来自前端升级（时域 10 通道 / 40 维统计量 / 新频域视图）之前，"
+                           "需用当前代码重新预训练+微调导出，旧权重无法加载")
     spec = cfg["model"].get("param_codec")
     model.codec = ParamCodec(spec) if spec else \
         ParamCodec.load(os.path.join(weights_dir, "param_codec.json"))
